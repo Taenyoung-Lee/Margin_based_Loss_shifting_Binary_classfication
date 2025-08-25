@@ -1,0 +1,364 @@
+---
+title: "loss_shift_paper_table_parallel_xor"
+output: html_document
+date: "2025-08-17"
+---
+
+
+```{r}
+## ───────────────────────────────────────────────────────────────────
+##  Dependencies
+## ───────────────────────────────────────────────────────────────────
+suppressPackageStartupMessages({
+  library(e1071)
+  library(glmnet)
+  library(knitr); library(kableExtra)
+  library(future)
+  library(future.apply)
+  library(progressr)
+})
+
+## ───────────────────────────────────────────────────────────────────
+## 1) 표 컬럼 정의 (rate_pos, rate_neg 추가)
+## ───────────────────────────────────────────────────────────────────
+TABLE_COLS <- c(
+  "n","p","rate_pos","rate_neg","true",
+  "hinge_none","sqhinge_none","logistic_none","exp_none",
+  "hinge_soft","sqhinge_soft","logistic_soft","exp_soft",
+  "hinge_hard","sqhinge_hard","logistic_hard","exp_hard",
+  "e1071_hard","e1071_soft","glm","glmnet"
+)
+DISPLAY_NAMES <- c(
+  "n","p","rate_pos","rate_neg","true",
+  "hinge-none","sqhinge-none","logistic-none","exp-none",
+  "hinge-soft","sqhinge-soft","logistic-soft","exp-soft",
+  "hinge-hard","sqhinge-hard","logistic-hard","exp-hard",
+  "e1071(hard margin)","e1071(soft margin)","glm","glmnet"
+)
+MODEL_COLS <- setdiff(TABLE_COLS, c("n","p","rate_pos","rate_neg","true"))
+
+acc <- function(y_true, y_pred) mean(y_true == y_pred)
+
+## ───────────────────────────────────────────────────────────────────
+## 2) 데이터 생성 함수들
+## ───────────────────────────────────────────────────────────────────
+# 기존 가우시안 데이터 생성: pos ~ N((1,1), I2), neg ~ N((-1,-1), I2)
+gen_gauss_2d <- function(n, p = 2, seed = NULL) {
+  stopifnot(p == 2)
+  if (!is.null(seed)) set.seed(seed)
+  n1 <- n %/% 2; n2 <- n - n1
+  Xpos <- cbind(rnorm(n1, mean =  1, sd = 1), rnorm(n1, mean =  1, sd = 1))
+  Xneg <- cbind(rnorm(n2, mean = -1, sd = 1), rnorm(n2, mean = -1, sd = 1))
+  X <- rbind(Xpos, Xneg)
+  y <- c(rep(1, n1), rep(-1, n2))
+  list(X = X, y = y)
+}
+
+# [추가] XOR 데이터 생성
+# pos: N((1,1), 0.5*I), N((-1,-1), 0.5*I)
+# neg: N((1,-1), 0.5*I), N((-1,1), 0.5*I)
+gen_xor_2d <- function(n, p = 2, mu = 1, sd = 0.5, seed = NULL) {
+  stopifnot(p == 2)
+  if (!is.null(seed)) set.seed(seed)
+  
+  # n을 4개의 그룹으로 나눔
+  n_per_quad <- n %/% 4
+  n_rem <- n %% 4
+  ns <- rep(n_per_quad, 4) + c(rep(1, n_rem), rep(0, 4 - n_rem))
+
+  # Class +1: (mu, mu), (-mu, -mu)
+  X_p1 <- cbind(rnorm(ns[1], mean =  mu, sd = sd), rnorm(ns[1], mean =  mu, sd = sd))
+  X_p2 <- cbind(rnorm(ns[2], mean = -mu, sd = sd), rnorm(ns[2], mean = -mu, sd = sd))
+
+  # Class -1: (mu, -mu), (-mu, mu)
+  X_n1 <- cbind(rnorm(ns[3], mean =  mu, sd = sd), rnorm(ns[3], mean = -mu, sd = sd))
+  X_n2 <- cbind(rnorm(ns[4], mean = -mu, sd = sd), rnorm(ns[4], mean =  mu, sd = sd))
+
+  X <- rbind(X_p1, X_p2, X_n1, X_n2)
+  y <- c(rep(1, ns[1] + ns[2]), rep(-1, ns[3] + ns[4]))
+  
+  # 데이터를 섞어서 순서에 따른 편향을 제거
+  shuffle_idx <- sample(n)
+  
+  list(X = X[shuffle_idx, ], y = y[shuffle_idx])
+}
+
+
+## ───────────────────────────────────────────────────────────────────
+## 3) 라벨 플립: 클래스별 비율 (rate_pos, rate_neg)
+## ───────────────────────────────────────────────────────────────────
+flip_labels_asym <- function(y, rate_pos = 0, rate_neg = 0, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  idx_p <- which(y ==  1); kp <- floor(length(idx_p) * rate_pos)
+  idx_n <- which(y == -1); kn <- floor(length(idx_n) * rate_neg)
+  flip_idx <- c(if (kp > 0) sample(idx_p, kp) else integer(0),
+                if (kn > 0) sample(idx_n, kn) else integer(0))
+  y2 <- y; if (length(flip_idx)) y2[flip_idx] <- -y2[flip_idx]
+  list(y = y2, flipped_idx = flip_idx)
+}
+
+## ───────────────────────────────────────────────────────────────────
+## 4) 외부 모델 래퍼 (e1071, glm, glmnet) - [수정]
+## ───────────────────────────────────────────────────────────────────
+# [수정] e1071 래퍼에 kernel 인자 추가
+pred_e1071 <- function(Xtr, ytr, Xte, cost, kernel = "linear") {
+  y_fac <- factor(ifelse(ytr > 0, "pos", "neg"))
+  fit <- e1071::svm(x = Xtr, y = y_fac, kernel = kernel,
+                    type = "C-classification", cost = cost, scale = FALSE)
+  pr <- predict(fit, Xte)
+  ifelse(pr == "pos", 1, -1)
+}
+pred_glm <- function(Xtr, ytr, Xte) {
+  dftr <- data.frame(y = ifelse(ytr > 0, 1, 0), X1 = Xtr[,1], X2 = Xtr[,2])
+  dftt <- data.frame(X1 = Xte[,1], X2 = Xte[,2])
+  fit <- glm(y ~ ., family = binomial(), data = dftr)
+  pr  <- predict(fit, newdata = dftt, type = "response")
+  ifelse(pr >= 0.5, 1, -1)
+}
+pred_glmnet <- function(Xtr, ytr, Xte, alpha = 1) {
+  y01 <- ifelse(ytr > 0, 1, 0)
+  cv  <- cv.glmnet(x = as.matrix(Xtr), y = y01,
+                   family = "binomial", alpha = alpha, nfolds = 5,
+                   type.measure = "deviance")
+  pr  <- as.numeric(predict(cv, newx = as.matrix(Xte), s = "lambda.min", type = "response"))
+  ifelse(pr >= 0.5, 1, -1)
+}
+
+## ───────────────────────────────────────────────────────────────────
+## 5) 시뮬레이션 1회 - [수정]
+##   - data_gen_fun: 사용할 데이터 생성 함수 (e.g., gen_gauss_2d)
+##   - oracle_fun: 해당 데이터의 이론적 최적 결정 경계 함수
+##   - kernel: 사용할 커널 ('linear', 'radial', etc.)
+## ───────────────────────────────────────────────────────────────────
+simulate_once <- function(n_train, n_test, rate_pos, rate_neg,
+                        data_gen_fun, oracle_fun, kernel = "linear",
+                        seed = NULL) {
+  Tr <- data_gen_fun(n_train, seed = if (is.null(seed)) NULL else seed + 1)
+  Te <- data_gen_fun(n_test,  seed = if (is.null(seed)) NULL else seed + 2)
+  Xtr <- Tr$X; ytr_clean <- Tr$y
+  Xte <- Te$X; yte_true  <- Te$y
+
+  ytr <- flip_labels_asym(ytr_clean, rate_pos = rate_pos, rate_neg = rate_neg,
+                          seed = if (is.null(seed)) NULL else seed + 3)$y
+
+  # loss-shifting 12개 (kernel 인자 전달)
+  preds_ls <- list()
+  for (st in c("none","soft","hard")) for (bl in c("hinge","sqhinge","logistic","exp")) {
+    set.seed(if (is.null(seed)) NULL else seed + 10*match(st, c("none","soft","hard")) + match(bl, c("hinge","sqhinge","logistic","exp")))
+    res <- train_loss_shift(
+      X_train = Xtr, y_train = ytr, X_test = Xte,
+      base_loss = bl, style = st, kernel = "gaussian", # kernel 인자 전달
+      restarts = 10, n_folds = 3, svm_dual = FALSE,
+      max_iter = 100, line_search = TRUE, verbose = FALSE,
+      seed = if (is.null(seed)) NULL else seed + 100
+    )
+    preds_ls[[paste0(bl,"_",st)]] <- res$test_pred
+  }
+
+  # 외부 모델들 (kernel 인자 전달)
+  pred_hard       <- pred_e1071(Xtr, ytr, Xte, cost = 1e6, kernel = kernel)
+  pred_soft       <- pred_e1071(Xtr, ytr, Xte, cost = 1.0, kernel = kernel)
+  pred_glm_       <- pred_glm(Xtr, ytr, Xte)
+  pred_glmnet_    <- pred_glmnet(Xtr, ytr, Xte, alpha = 1)
+
+  # 오라클(이론) 경계 (oracle_fun 사용)
+  pred_true_oracle <- oracle_fun(Xte)
+
+  c(
+    true           = acc(yte_true, pred_true_oracle),
+    hinge_none     = acc(yte_true, preds_ls$hinge_none),
+    sqhinge_none   = acc(yte_true, preds_ls$sqhinge_none),
+    logistic_none  = acc(yte_true, preds_ls$logistic_none),
+    exp_none       = acc(yte_true, preds_ls$exp_none),
+    hinge_soft     = acc(yte_true, preds_ls$hinge_soft),
+    sqhinge_soft   = acc(yte_true, preds_ls$sqhinge_soft),
+    logistic_soft  = acc(yte_true, preds_ls$logistic_soft),
+    exp_soft       = acc(yte_true, preds_ls$exp_soft),
+    hinge_hard     = acc(yte_true, preds_ls$hinge_hard),
+    sqhinge_hard   = acc(yte_true, preds_ls$sqhinge_hard),
+    logistic_hard  = acc(yte_true, preds_ls$logistic_hard),
+    exp_hard       = acc(yte_true, preds_ls$exp_hard),
+    e1071_hard     = acc(yte_true, pred_hard),
+    e1071_soft     = acc(yte_true, pred_soft),
+    glm            = acc(yte_true, pred_glm_),
+    glmnet         = acc(yte_true, pred_glmnet_)
+  )
+}
+
+## ───────────────────────────────────────────────────────────────────
+## 6) k회 반복 → 평균/표준편차 ("m (sd)" 문자열) - [수정]
+## ───────────────────────────────────────────────────────────────────
+mean_sd_fmt <- function(m, s, digits = 3) sprintf(paste0("%.",digits,"f (%.",digits,"f)"), m, s)
+
+simulate_k <- function(n_train, n_test, rate_pos, rate_neg,
+                       data_gen_fun, oracle_fun, kernel = "linear",
+                       k = 20, seed = 2025, digits = 3) {
+  res_mat <- matrix(NA_real_, nrow = k, ncol = length(c("true", MODEL_COLS)))
+  colnames(res_mat) <- c("true", MODEL_COLS)
+  for (i in seq_len(k)) {
+    A <- simulate_once(
+        n_train, n_test, rate_pos, rate_neg,
+        data_gen_fun = data_gen_fun,
+        oracle_fun = oracle_fun,
+        kernel = kernel,
+        seed = seed + i
+    )
+    res_mat[i, names(A)] <- A
+  }
+  means <- colMeans(res_mat, na.rm = TRUE)
+  sds   <- apply(res_mat, 2, sd, na.rm = TRUE)
+  list(means = means, sds = sds,
+       display = setNames(mean_sd_fmt(means, sds, digits), names(means)))
+}
+
+## ───────────────────────────────────────────────────────────────────
+## 7) 병렬 실행을 위한 그리드 실행 + 표 생성 - [수정]
+## ───────────────────────────────────────────────────────────────────
+run_grid_parallel <- function(n_vec, rates_pos, rates_neg, n_test,
+                              data_gen_fun, oracle_fun, kernel = "linear",
+                              k = 20, seed = 2025, digits = 3) {
+  p <- 2
+  plan(multisession)
+  
+  param_grid <- expand.grid(n = n_vec, rp = rates_pos, rn = rates_neg,
+                            stringsAsFactors = FALSE)
+
+  cat(sprintf("Running %d simulation sets in parallel (k=%d reps each)...\n", nrow(param_grid), k))
+
+  with_progress({
+    p_bar <- progressor(steps = nrow(param_grid))
+    
+    rows_list <- future_lapply(1:nrow(param_grid), function(i) {
+      n_run <- param_grid$n[i]
+      rp_run <- param_grid$rp[i]
+      rn_run <- param_grid$rn[i]
+
+      R <- simulate_k(
+        n_train = n_run, n_test = n_test,
+        rate_pos = rp_run, rate_neg = rn_run,
+        data_gen_fun = data_gen_fun, # 전달
+        oracle_fun = oracle_fun,     # 전달
+        kernel = kernel,             # 전달
+        k = k, seed = seed + i, digits = digits
+      )
+      
+      p_bar(sprintf("n=%d, rp=%.2f", n_run, rp_run))
+      c(n = n_run, p = p, rate_pos = rp_run, rate_neg = rn_run, R$display)
+    }, future.seed = TRUE)
+  })
+
+  cat("All simulations complete. Combining results...\n")
+  df <- do.call(rbind, rows_list) |> as.data.frame(check.names = FALSE)
+  df$n <- as.integer(df$n); df$p <- as.integer(df$p)
+  df$rate_pos <- as.numeric(df$rate_pos); df$rate_neg <- as.numeric(df$rate_neg)
+  
+  df <- df[ , c("n","p","rate_pos","rate_neg","true", MODEL_COLS)]
+  df[order(df$n, df$p, df$rate_pos, df$rate_neg), ]
+}
+```
+
+```{r}
+## ───────────────────────────────────────────────────────────────────
+## 사용 예시 (Gaussian & XOR)
+## ───────────────────────────────────────────────────────────────────
+
+# 1. 학습/예측 함수 로드 (train_loss_shift 함수가 포함된 파일)
+source("loss_shifting_v4.R") 
+
+# 2. 데이터셋별 오라클 함수 정의
+#oracle_gauss <- function(Xte) ifelse(rowSums(Xte) >= 0, 1, -1)
+oracle_xor <- function(Xte) ifelse(Xte[,1] * Xte[,2] >= 0, 1, -1)
+
+# 3. 시뮬레이션 파라미터 설정
+N_VEC <- c(200, 400)
+RATES_POS <- c(0.00, 0.05, 0.10, 0.15, 0.2)
+RATES_NEG <- c(0.00)
+N_TEST <- 800
+K_REPS <- 100
+SEED <- 1357
+DIGITS <- 5
+```
+
+
+```{r, include=FALSE}
+# ===============================================
+# 시나리오 1: Gaussian 데이터 (Linear Kernel)
+# ===============================================
+#cat("\n--- Running Scenario 1: Gaussian Data with Linear Kernel ---\n")
+tbl_gauss_linear <- run_grid_parallel(
+  n_vec        = N_VEC,
+  rates_pos    = RATES_POS,
+  rates_neg    = RATES_NEG,
+  n_test       = N_TEST,
+  data_gen_fun = gen_gauss_2d, # 가우시안 데이터 생성 함수
+  oracle_fun   = oracle_gauss, # 가우시안 오라클
+  kernel       = "linear",     # 선형 커널
+  k            = K_REPS,
+  seed         = SEED,
+  digits       = DIGITS
+)
+# 결과에 시나리오 정보 추가
+tbl_gauss_linear$scenario <- "Gaussian (Linear Kernel)"
+```
+
+
+```{r, include=FALSE}
+# ===============================================
+# 시나리오 2: XOR 데이터 (Linear Kernel)
+# ===============================================
+# 선형 모델은 XOR 문제를 풀 수 없으므로, 정확도는 0.5 근처로 매우 낮게 나올 것으로 예상됩니다.
+# 이는 비선형 문제에 선형 모델을 적용했을 때의 기준 성능을 보여줍니다.
+cat("\n--- Running Scenario 2: XOR Data with Linear Kernel ---\n")
+tbl_xor_linear <- run_grid_parallel(
+  n_vec        = N_VEC,
+  rates_pos    = RATES_POS,
+  rates_neg    = RATES_NEG,
+  n_test       = N_TEST,
+  data_gen_fun = gen_xor_2d,   # XOR 데이터 생성 함수
+  oracle_fun   = oracle_xor,   # XOR 오라클
+  kernel       = "linear",     # 선형 커널
+  k            = K_REPS,
+  seed         = SEED,
+  digits       = DIGITS
+)
+tbl_xor_linear$scenario <- "XOR (Linear Kernel)"
+```
+
+
+```{r}
+# ===============================================
+# (선택) 시나리오 3: XOR 데이터 (RBF Kernel)
+# ===============================================
+# RBF(방사 기저 함수) 커널을 사용하면 비선형 결정 경계를 학습할 수 있습니다.
+# glm과 glmnet은 선형 모델이므로 이 시나리오에서는 여전히 성능이 낮습니다.
+cat("\n--- Running Scenario 3: XOR Data with RBF Kernel ---\n")
+tbl_xor_rbf <- run_grid_parallel(
+  n_vec        = N_VEC,
+  rates_pos    = RATES_POS,
+  rates_neg    = RATES_NEG,
+  n_test       = N_TEST,
+  data_gen_fun = gen_xor_2d,   # XOR 데이터 생성 함수
+  oracle_fun   = oracle_xor,   # XOR 오라클
+  kernel       = "radial",     # RBF 커널 (e1071에서는 "radial")
+  k            = K_REPS,
+  seed         = SEED,
+  digits       = DIGITS
+)
+tbl_xor_rbf$scenario <- "XOR (RBF Kernel)"
+
+
+# 4. 모든 결과 합치기 및 저장
+# -----------------------------
+final_results <- (tbl_xor_rbf)
+
+# scenario 컬럼을 맨 앞으로 이동
+final_results <- final_results[, c("scenario", setdiff(names(final_results), "scenario"))]
+
+# CSV 파일로 저장
+write.csv(final_results, "0817_results.csv", row.names = FALSE)
+
+# 최종 결과 테이블 출력
+print(final_results)
+```
+
+
