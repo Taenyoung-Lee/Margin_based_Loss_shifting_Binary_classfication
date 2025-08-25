@@ -7,16 +7,19 @@ output: html_document
 
 ```{r}
 ## ───────────────────────────────────────────────────────────────────
-##  Dependencies
+## 0) Dependencies
 ## ───────────────────────────────────────────────────────────────────
 suppressPackageStartupMessages({
   library(e1071)
   library(glmnet)
-  library(knitr); library(kableExtra)
+  library(knitr)
+  library(kableExtra)
+  library(future)
+  library(future.apply)
 })
 
 ## ───────────────────────────────────────────────────────────────────
-## 1) 표 컬럼 정의 (rate_pos, rate_neg 추가)
+## 1) 표 컬럼 정의
 ## ───────────────────────────────────────────────────────────────────
 TABLE_COLS <- c(
   "n","p","rate_pos","rate_neg","true",
@@ -37,7 +40,7 @@ MODEL_COLS <- setdiff(TABLE_COLS, c("n","p","rate_pos","rate_neg","true"))
 acc <- function(y_true, y_pred) mean(y_true == y_pred)
 
 ## ───────────────────────────────────────────────────────────────────
-## 2) 데이터 생성 (p=2 고정): pos ~ N((1,1), I2), neg ~ N((-1,-1), I2)
+## 2) 데이터 생성
 ## ───────────────────────────────────────────────────────────────────
 gen_gauss_2d <- function(n, p = 2, seed = NULL) {
   stopifnot(p == 2)
@@ -51,7 +54,7 @@ gen_gauss_2d <- function(n, p = 2, seed = NULL) {
 }
 
 ## ───────────────────────────────────────────────────────────────────
-## 3) 라벨 플립: 클래스별 비율 (rate_pos, rate_neg)
+## 3) 라벨 플립
 ## ───────────────────────────────────────────────────────────────────
 flip_labels_asym <- function(y, rate_pos = 0, rate_neg = 0, seed = NULL) {
   if (!is.null(seed)) set.seed(seed)
@@ -64,7 +67,7 @@ flip_labels_asym <- function(y, rate_pos = 0, rate_neg = 0, seed = NULL) {
 }
 
 ## ───────────────────────────────────────────────────────────────────
-## 4) 외부 모델 래퍼 (e1071, glm, glmnet)
+## 4) 외부 모델 래퍼
 ## ───────────────────────────────────────────────────────────────────
 pred_e1071 <- function(Xtr, ytr, Xte, cost) {
   y_fac <- factor(ifelse(ytr > 0, "pos", "neg"))
@@ -80,7 +83,7 @@ pred_glm <- function(Xtr, ytr, Xte) {
   pr  <- predict(fit, newdata = dftt, type = "response")
   ifelse(pr >= 0.5, 1, -1)
 }
-pred_glmnet <- function(Xtr, ytr, Xte, alpha = 0) {
+pred_glmnet <- function(Xtr, ytr, Xte, alpha = 1) {
   y01 <- ifelse(ytr > 0, 1, 0)
   cv  <- cv.glmnet(x = as.matrix(Xtr), y = y01,
                    family = "binomial", alpha = alpha, nfolds = 5,
@@ -90,12 +93,16 @@ pred_glmnet <- function(Xtr, ytr, Xte, alpha = 0) {
 }
 
 ## ───────────────────────────────────────────────────────────────────
-## 5) 시뮬레이션 1회
-##    - train 라벨: (rate_pos, rate_neg) 비율로 뒤집기
-##    - 평가 모델: loss-shift(12), e1071 hard/soft, glm, glmnet
-##    - true: 공분산 동일(I), 사전확률 동일 → 오라클 경계 sign(x1 + x2)
+## 5) 시뮬레이션 1회 실행 함수 (이 함수는 병렬 처리의 기본 단위가 됨)
 ## ───────────────────────────────────────────────────────────────────
 simulate_once <- function(n_train, n_test, rate_pos, rate_neg, seed = NULL) {
+  # `train_loss_shift` 함수가 필요합니다.
+  # 이 함수는 별도 파일(loss_shifting_v2_2.R)에 있다고 가정합니다.
+  # 만약 없다면 이 스크립트에 해당 함수 정의를 포함해야 합니다.
+  if (!exists("train_loss_shift")) {
+    stop("`train_loss_shift` 함수가 정의되지 않았습니다. loss_shifting_v2_2.R 파일을 source() 하거나 함수 정의를 여기에 추가하세요.")
+  }
+
   Tr <- gen_gauss_2d(n_train, seed = if (is.null(seed)) NULL else seed + 1)
   Te <- gen_gauss_2d(n_test,  seed = if (is.null(seed)) NULL else seed + 2)
   Xtr <- Tr$X; ytr_clean <- Tr$y
@@ -104,100 +111,92 @@ simulate_once <- function(n_train, n_test, rate_pos, rate_neg, seed = NULL) {
   ytr <- flip_labels_asym(ytr_clean, rate_pos = rate_pos, rate_neg = rate_neg,
                           seed = if (is.null(seed)) NULL else seed + 3)$y
 
-  # loss-shifting 12개 (linear)
   preds_ls <- list()
   for (st in c("none","soft","hard")) for (bl in c("hinge","sqhinge","logistic","exp")) {
     set.seed(if (is.null(seed)) NULL else seed + 10*match(st, c("none","soft","hard")) + match(bl, c("hinge","sqhinge","logistic","exp")))
     res <- train_loss_shift(
       X_train = Xtr, y_train = ytr, X_test = Xte,
       base_loss = bl, style = st, kernel = "linear",
-      lambda_grid = 10^seq(-3, 1, length.out = 5),
-      restarts = 3, n_folds = 3, svm_dual = FALSE,
-      max_iter = 100, line_search = TRUE, verbose = FALSE,
+      restarts = 10, n_folds = 3, svm_dual = FALSE,
+      max_iter = 100, line_search = TRUE, verbose = FALSE, # verbose는 FALSE로 변경
       seed = if (is.null(seed)) NULL else seed + 100
     )
     preds_ls[[paste0(bl,"_",st)]] <- res$test_pred
   }
 
-  # 외부 모델들
-  pred_hard     <- pred_e1071(Xtr, ytr, Xte, cost = 1e6)  # 하드마진 근사
-  pred_soft     <- pred_e1071(Xtr, ytr, Xte, cost = 1.0)  # 소프트마진
-  pred_glm_     <- pred_glm(Xtr, ytr, Xte)
-  pred_glmnet_  <- pred_glmnet(Xtr, ytr, Xte, alpha = 0)
-
-  # 오라클(이론) 경계
-  pred_true_oracle <- ifelse(rowSums(Xte) >= 0, 1, -1)
+  pred_hard          <- pred_e1071(Xtr, ytr, Xte, cost = 1e6)
+  pred_soft          <- pred_e1071(Xtr, ytr, Xte, cost = 1.0)
+  pred_glm_          <- pred_glm(Xtr, ytr, Xte)
+  pred_glmnet_       <- pred_glmnet(Xtr, ytr, Xte, alpha = 1)
+  pred_true_oracle   <- ifelse(rowSums(Xte) >= 0, 1, -1)
 
   c(
-    true           = acc(yte_true, pred_true_oracle),
-    hinge_none     = acc(yte_true, preds_ls$hinge_none),
-    sqhinge_none   = acc(yte_true, preds_ls$sqhinge_none),
-    logistic_none  = acc(yte_true, preds_ls$logistic_none),
-    exp_none       = acc(yte_true, preds_ls$exp_none),
-    hinge_soft     = acc(yte_true, preds_ls$hinge_soft),
-    sqhinge_soft   = acc(yte_true, preds_ls$sqhinge_soft),
-    logistic_soft  = acc(yte_true, preds_ls$logistic_soft),
-    exp_soft       = acc(yte_true, preds_ls$exp_soft),
-    hinge_hard     = acc(yte_true, preds_ls$hinge_hard),
-    sqhinge_hard   = acc(yte_true, preds_ls$sqhinge_hard),
-    logistic_hard  = acc(yte_true, preds_ls$logistic_hard),
-    exp_hard       = acc(yte_true, preds_ls$exp_hard),
-    e1071_hard     = acc(yte_true, pred_hard),
-    e1071_soft     = acc(yte_true, pred_soft),
-    glm            = acc(yte_true, pred_glm_),
-    glmnet         = acc(yte_true, pred_glmnet_)
+    true            = acc(yte_true, pred_true_oracle),
+    hinge_none      = acc(yte_true, preds_ls$hinge_none),
+    sqhinge_none    = acc(yte_true, preds_ls$sqhinge_none),
+    logistic_none   = acc(yte_true, preds_ls$logistic_none),
+    exp_none        = acc(yte_true, preds_ls$exp_none),
+    hinge_soft      = acc(yte_true, preds_ls$hinge_soft),
+    sqhinge_soft    = acc(yte_true, preds_ls$sqhinge_soft),
+    logistic_soft   = acc(yte_true, preds_ls$logistic_soft),
+    exp_soft        = acc(yte_true, preds_ls$exp_soft),
+    hinge_hard      = acc(yte_true, preds_ls$hinge_hard),
+    sqhinge_hard    = acc(yte_true, preds_ls$sqhinge_hard),
+    logistic_hard   = acc(yte_true, preds_ls$logistic_hard),
+    exp_hard        = acc(yte_true, preds_ls$exp_hard),
+    e1071_hard      = acc(yte_true, pred_hard),
+    e1071_soft      = acc(yte_true, pred_soft),
+    glm             = acc(yte_true, pred_glm_),
+    glmnet          = acc(yte_true, pred_glmnet_)
   )
 }
 
 ## ───────────────────────────────────────────────────────────────────
-## 6) k회 반복 → 평균/표준편차 ("m (sd)" 문자열)
+## 6) k회 반복을 병렬 처리하는 함수
 ## ───────────────────────────────────────────────────────────────────
 mean_sd_fmt <- function(m, s, digits = 3) sprintf(paste0("%.",digits,"f (%.",digits,"f)"), m, s)
 
-simulate_k <- function(n_train, n_test, rate_pos, rate_neg, k = 20, seed = 2025, digits = 3) {
-  res_mat <- matrix(NA_real_, nrow = k, ncol = length(c("true", MODEL_COLS)))
-  colnames(res_mat) <- c("true", MODEL_COLS)
-  for (i in seq_len(k)) {
-    A <- simulate_once(n_train, n_test, rate_pos, rate_neg, seed = seed + i)
-    res_mat[i, names(A)] <- A
-  }
+simulate_k_parallel_inner <- function(n_train, n_test, rate_pos, rate_neg, k = 20, seed = 2025, digits = 3) {
+  
+  cat(sprintf("  - Running k=%d reps in parallel for (n=%d, rp=%.2f)...\n", k, n_train, rate_pos))
+  
+  results_list <- future_lapply(1:k, function(i) {
+    simulate_once(n_train, n_test, rate_pos, rate_neg, seed = seed + i)
+  }, future.seed = TRUE)
+  
+  res_mat <- do.call(rbind, results_list)
   means <- colMeans(res_mat, na.rm = TRUE)
   sds   <- apply(res_mat, 2, sd, na.rm = TRUE)
+
   list(means = means, sds = sds,
        display = setNames(mean_sd_fmt(means, sds, digits), names(means)))
 }
 
 ## ───────────────────────────────────────────────────────────────────
-## 7) (n, rate_pos, rate_neg) 그리드 실행 + 표 생성
+## 7) 파라미터 그리드를 순차적으로 실행하는 메인 함수
 ## ───────────────────────────────────────────────────────────────────
-run_grid <- function(n_vec, rates_pos, rates_neg, n_test, k = 20, seed = 2025, digits = 3) {
+run_grid_sequential_outer <- function(n_vec, rates_pos, rates_neg, n_test, k = 20, seed = 2025, digits = 3) {
   p <- 2
   rows <- list(); ridx <- 1
+  
   for (n in n_vec) for (rp in rates_pos) for (rn in rates_neg) {
-    cat(sprintf("Running: n=%d, p=2, rate_pos=%.2f, rate_neg=%.2f (k=%d)\n", n, rp, rn, k))
-    R <- simulate_k(n_train = n, n_test = n_test, rate_pos = rp, rate_neg = rn,
-                    k = k, seed = seed + ridx, digits = digits)
+    cat(sprintf("Running grid point: n=%d, p=2, rate_pos=%.2f, rate_neg=%.2f\n", n, rp, rn))
+    
+    R <- simulate_k_parallel_inner(
+      n_train = n, n_test = n_test, rate_pos = rp, rate_neg = rn,
+      k = k, seed = seed + ridx, digits = digits
+    )
+    
     row <- c(n = n, p = p, rate_pos = rp, rate_neg = rn, R$display)
     rows[[ridx]] <- row; ridx <- ridx + 1
   }
+  
   df <- do.call(rbind, rows) |> as.data.frame(check.names = FALSE)
   df$n <- as.integer(df$n); df$p <- as.integer(df$p)
   df$rate_pos <- as.numeric(df$rate_pos); df$rate_neg <- as.numeric(df$rate_neg)
   df <- df[ , c("n","p","rate_pos","rate_neg","true", MODEL_COLS)]
   df[order(df$n, df$p, df$rate_pos, df$rate_neg), ]
 }
-
-print_results_table_latex <- function(df) {
-  df_print <- df
-  df_print$n <- as.character(df_print$n); df_print$p <- as.character(df_print$p)
-  knitr::kable(
-    df_print, format = "latex", booktabs = TRUE,
-    col.names = DISPLAY_NAMES, align = rep("r", ncol(df_print))
-  ) |>
-    kableExtra::kable_styling(latex_options = c("hold_position")) |>
-    kableExtra::collapse_rows(columns = 1:2, valign = "top")
-}
-
 
 ```
 
@@ -207,20 +206,27 @@ print_results_table_latex <- function(df) {
 ## ───────────────────────────────────────────────────────────────────
 ## 사용 예시
 ## ───────────────────────────────────────────────────────────────────
-source("loss_shifting_v2-2.R")  # ← 네 학습/예측 함수 로드
-tbl <- run_grid(
+source("loss_shifting_v2_2.R") # ← 네 학습/예측 함수 로드
+
+
+# 병렬 백엔드 설정 (사용 가능한 모든 코어를 사용)
+plan(multisession)
+cat(sprintf("Parallel backend is set up with %d workers.\n", nbrOfWorkers()))
+
+# 메인 함수 호출
+tbl <- run_grid_sequential_outer(
   n_vec     = c(200),
   rates_pos = c(0.00, 0.05, 0.10, 0.15),
   rates_neg = c(0.00),
-  n_test    = 500,
-  k         = 2,
+  n_test    = 600,
+  k         = 50,
   seed      = 1357,
   digits    = 5
 )
-# print_results_table_latex(tbl)
-write.csv(tbl, "0814_asymflip_table.csv", row.names = FALSE)
+
+# 결과 출력 및 저장
+print(tbl)
+write.csv(tbl, "0814_asymflip_table_inner_parallel.csv", row.names = FALSE)
+
 
 ```
-
-
-

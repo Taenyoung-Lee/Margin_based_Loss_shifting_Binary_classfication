@@ -1,7 +1,8 @@
 ########################################################################
-#  loss_shifting_v2.R   (2025-08-09)
+#  loss_shifting_v3.R   (2025-08-14)
+#  - 'warm-start' 용어를 'pre_trained_initial'로 변경
+#  - linear 커널에서도 자동 표준화 적용 (범용 'standardize' 옵션)
 #  - sigma grid: median heuristic on z-scored X
-#  - Gaussian kernel uses the same z-scoring in train & predict
 #  - reproducibility, Gaussian fold-dim init, final restarts kept
 ########################################################################
 
@@ -42,7 +43,8 @@ update_f_hinge_MM <- function(theta, X, y, r, lambda,
   X_aug <- cbind(1, X); eps <- 1e-4
   for (it in seq_len(max_inner)) {
     f_val <- as.vector(X_aug %*% theta)
-    u0    <- y * (f_val - r)
+    #u0    <- y * (f_val - r) ############################################################ 에러 의심
+    u0 <- y * f_val - r
     w_vec <- 1 / (4 * abs(1 - u0) + eps)
     t_vec <- y * (r + 1 + abs(1 - u0))
     WX    <- sqrt(w_vec) * X_aug
@@ -63,7 +65,8 @@ update_f_sqhinge_MM <- function(theta, X, y, r, lambda,
   X_aug <- cbind(1, X)
   for (it in seq_len(max_inner)) {
     f_val <- as.vector(X_aug %*% theta)
-    u0    <- y * (f_val - r)
+    #u0    <- y * (f_val - r) ########################################################에러 의심
+    u0 <- y * f_val - r
     t_vec <- y * (r + pmax(1, u0))
     A     <- crossprod(X_aug) + make_penalty_mat(p, n, lambda)
     b     <- crossprod(X_aug, t_vec)
@@ -78,11 +81,14 @@ update_f_sqhinge_MM <- function(theta, X, y, r, lambda,
 update_f_logistic_IRLS <- function(theta, X, y, r, lambda,
                                    max_inner = 20, tol_inner = 1e-6, verbose_inner = FALSE) {
   X_aug <- cbind(1, X); n <- nrow(X); p <- ncol(X)
-  w_min <- 1e-8; eps_rd <- 1e-6
+  w_min <- 1e-5; eps_rd <- 1e-4 # 안정성을 위해 1e-5 -> 1e-4
   for (it in seq_len(max_inner)) {
     f_val <- as.vector(X_aug %*% theta)
-    u     <- y * (f_val - r)
-    sigma <- 1 / (1 + exp(u))
+    #u     <- y * (f_val - r) #################################################에러의심
+    #sigma <- 1 / (1 + exp(u))#################################################에러의심
+    u_eff <- y * f_val - r
+    sigma <- 1 / (1 + exp(u_eff))
+    
     w_vec <- pmax(sigma * (1 - sigma), w_min)
     grad  <- c((-1 / n) * sum(y * sigma),
                (-1 / n) * (t(X) %*% (y * sigma)) + lambda * theta[-1])
@@ -99,11 +105,15 @@ update_f_logistic_IRLS <- function(theta, X, y, r, lambda,
 update_f_exponential_IRLS <- function(theta, X, y, r, lambda,
                                       max_inner = 20, tol_inner = 1e-6, verbose_inner = FALSE) {
   X_aug <- cbind(1, X); n <- nrow(X); p <- ncol(X)
-  w_min <- 1e-6; eps_rd <- 1e-5
+  w_min <- 1e-5; eps_rd <- 1e-4 # 안정성을 위해 1e-5 -> 1e-4
   for (it in seq_len(max_inner)) {
     f_val <- as.vector(X_aug %*% theta)
-    u     <- y * (f_val - r)
-    e_neg <- exp(-u)
+    #u     <- y * (f_val - r) #################################################에러의심
+    #e_neg <- exp(-u) #################################################에러의심
+    u_eff <- y * f_val - r
+    e_neg <- exp(-u_eff)
+    #u_eff_capped <- pmax(u_eff, -700) 
+    #e_neg <- exp(-u_eff_capped) ###############################필요할까?오버플로우 막기
     w_vec <- pmax(e_neg, w_min)
     grad  <- c((-1 / n) * sum(e_neg * y),
                (-1 / n) * (t(X) %*% (e_neg * y)) + lambda * theta[-1])
@@ -164,7 +174,7 @@ dual_svm_sqhinge <- function(X, y, r, lambda) {
   list(theta = c(b0, beta), alpha = alpha)
 }
 
-#################### (6) 라인 서치 ###################################
+#################### (7) 라인 서치 ###################################
 line_search_choice <- function(theta_old, theta_raw, X, y, shift_fun, loss_fun, lambda,
                                step_set = 2 ^ c(-2, -1, 0, 1, 2)) {
   candidates <- lapply(step_set, function(s) theta_old + s * (theta_raw - theta_old))
@@ -198,7 +208,7 @@ loss_shift_classifier_all <- function(
     line_search = TRUE,
     step_set = 2^c(-2, -1, 0, 1),
     verbose = FALSE,
-    standardize_gaussian = TRUE   # ← 가우시안이면 z-score 사용
+    standardize = TRUE
 ) {
   X_mat <- as.matrix(X)
   y_vec <- ifelse(y > 0, 1, -1)
@@ -207,23 +217,25 @@ loss_shift_classifier_all <- function(
   kernel    <- match.arg(kernel)
   use_dual  <- svm_dual && base_loss %in% c("hinge", "sqhinge")
   
+  # 먼저 표준화를 수행 (범용)
+  if (standardize) {
+    st <- .standardize_fit(X_mat)
+    X_proc <- st$Xs
+  } else {
+    st <- NULL
+    X_proc <- X_mat
+  }
+  
+  # 커널에 따라 피처 공간(X_feat)을 결정
   if (kernel == "gaussian") {
-    if (standardize_gaussian) {
-      st <- .standardize_fit(X_mat)
-      X_for_k <- st$Xs
-    } else {
-      st <- NULL
-      X_for_k <- X_mat
-    }
-    K_train <- rbf_kernel(X_for_k, NULL, sigma)
+    K_train <- rbf_kernel(X_proc, NULL, sigma) # 표준화된 X_proc 사용
     eig     <- eigen(K_train, symmetric = TRUE)
     vals    <- pmax(eig$values, .Machine$double.eps)
     U       <- eig$vectors
     D_half  <- diag(sqrt(vals))
     X_feat  <- U %*% D_half
-  } else {
-    st <- NULL
-    X_feat <- X_mat
+  } else { # 리니어 커널
+    X_feat <- X_proc # 표준화된 X_proc를 그대로 사용
   }
   
   shift_fun <- switch(style,
@@ -238,6 +250,7 @@ loss_shift_classifier_all <- function(
                     logistic = update_f_logistic_IRLS, exp = update_f_exponential_IRLS)
   
   n <- nrow(X_feat); p <- ncol(X_feat)
+  
   theta <- if (!is.null(init_theta) && length(init_theta) == p + 1) init_theta else rep(0, p + 1)
   
   obj_old <- objective_value(theta, X_feat, y_vec, shift_fun, loss_fun, lambda)
@@ -256,7 +269,7 @@ loss_shift_classifier_all <- function(
       updater(theta, X_feat, y_vec, r_vec, lambda, max_inner, tol)
     }
     
-    theta_new <- if (line_search && style != "none" && !use_dual)
+    theta_new <- if (line_search && !use_dual)
       line_search_choice(theta, theta_raw, X_feat, y_vec, shift_fun, loss_fun, lambda, step_set)
     else theta_raw
     
@@ -271,33 +284,58 @@ loss_shift_classifier_all <- function(
   out <- list(theta = theta, base_loss = base_loss, style = style, kernel = kernel,
               sigma = sigma, alpha = alpha, eta = eta, lambda = lambda,
               iter_used = iter_used, step_set = step_set,
-              standardize_gaussian = standardize_gaussian)
+              standardize = standardize)
+  
+  # 표준화 정보를 저장 (두 커널 모두에 해당)
+  if (isTRUE(standardize)) {
+    out$center <- st$mu
+    out$scale <- st$sd
+  }
+  
   if (kernel == "gaussian") {
     out$U <- U; out$D_inv_sqrt <- 1 / sqrt(vals); out$X_train_orig <- X_mat
-    if (!is.null(st)) { out$center <- st$mu; out$scale <- st$sd }
   }
   out
 }
 
 #################### (9) 예측 ########################################
-predict_loss_shift <- function(model, X_new) {
+predict_loss_shift <- function(model, X_new, type = "class") {
+  X_new_mat <- as.matrix(X_new)
+  
+  # Step 1: 모델이 표준화를 사용했다면 새로운 데이터도 동일하게 표준화
+  if (isTRUE(model$standardize)) {
+    X_proc <- .standardize_apply(X_new_mat, model$center, model$scale)
+  } else {
+    X_proc <- X_new_mat
+  }
+  
+  # Step 2: 커널에 따라 예측 피처 공간을 구성
   if (model$kernel == "gaussian") {
     X_tr <- model$X_train_orig
-    if (isTRUE(model$standardize_gaussian)) {
-      X_trs <- .standardize_apply(X_tr, model$center, model$scale)
-      X_ns  <- .standardize_apply(as.matrix(X_new), model$center, model$scale)
-      K_new <- rbf_kernel(X_ns, X_trs, model$sigma)
+    
+    # 가우시안 커널 계산을 위해 학습 데이터도 표준화
+    if (isTRUE(model$standardize)) {
+      X_tr_proc <- .standardize_apply(X_tr, model$center, model$scale)
     } else {
-      K_new <- rbf_kernel(as.matrix(X_new), X_tr, model$sigma)
+      X_tr_proc <- X_tr
     }
+    
+    K_new <- rbf_kernel(X_proc, X_tr_proc, model$sigma)
     Z_new <- K_new %*% model$U %*% diag(model$D_inv_sqrt)
     X_aug <- cbind(1, Z_new)
-  } else {
-    X_aug <- cbind(1, as.matrix(X_new))
+  } else { # 리니어 커널
+    X_aug <- cbind(1, X_proc)
   }
+  
+  # Step 3: 최종 점수 및 클래스 계산
   f_val <- as.vector(X_aug %*% model$theta)
+  
+  if (type == "score") {
+    return(f_val)
+  }
   ifelse(f_val >= 0, 1, -1)
 }
+
 
 #################### (10) 평가 지표 ###################################
 evaluate_metrics <- function(truth, pred) {
@@ -364,7 +402,7 @@ cv_accuracy_restart <- function(
         svm_dual = svm_dual, max_iter = max_iter,
         line_search = line_search, step_set = step_set,
         init_theta = init_th, verbose = FALSE,
-        standardize_gaussian = TRUE)
+        standardize = TRUE)
       accs[i] <- if (length(va) == 0) NA else mean(predict_loss_shift(mod, X[va, ]) == y[va])
     }
     best_acc <- max(best_acc, mean(accs, na.rm = TRUE))
@@ -441,7 +479,13 @@ fullgrid_tune_loss_shift <- function(
   if (model$kernel == "gaussian") {
     D_half <- diag(1 / model$D_inv_sqrt)   # = diag(sqrt(vals))
     X_feat <- model$U %*% D_half
-  } else X_feat <- as.matrix(X)
+  } else {
+    if (isTRUE(model$standardize)) {
+      X_feat <- .standardize_apply(as.matrix(X), model$center, model$scale)
+    } else {
+      X_feat <- as.matrix(X)
+    }
+  }
   objective_value(model$theta, X_feat, y_vec, shift_fun, loss_fun, model$lambda)
 }
 
@@ -449,17 +493,19 @@ fullgrid_tune_loss_shift <- function(
 fit_loss_shift <- function(
     X, y,
     base_loss = "hinge", style = "none", kernel = "gaussian",
-    lambda_grid = 10^seq(-3, 1, len = 3),
-    sigma_grid  = NULL,                 # ignored for gaussian
-    alpha_grid  = c(0.5, 1, 2),
-    eta_grid    = c(0.1, 0.5, 1),
-    restarts    = 5,
+    lambda_grid = 2^seq(-12, 8, 1),
+    sigma_grid  = NULL,              # ignored for gaussian
+    alpha_grid  = c(0.1, 0.25, 0.5, 1, 2, 4),
+    eta_grid    = c(0.25, 0.5, 0.75, 1, 1.5, 2, 3),
+    restarts    = 10,
     n_folds     = 5, val_frac = 0.2,
     svm_dual    = FALSE, max_iter = 100,
-    line_search = TRUE, step_set = 2^c(-2, -1, 0, 1),
+    line_search = TRUE, step_set = 2^c(-3, -2, -1, 0, 1, 2),
     verbose     = FALSE,
     seed        = NULL,
-    sigma_mult  = c(0.5,1,2)) {
+    sigma_mult  = c(0.125,0.25,0.5,1,2,),
+    init_theta  = NULL
+) {
   
   if (!is.null(seed)) set.seed(seed)
   
@@ -478,15 +524,19 @@ fit_loss_shift <- function(
   best_mod <- NULL; best_obj <- Inf
   p_full <- if (kernel == "gaussian") nrow(X) else ncol(X)
   for (r in seq_len(restarts)) {
-    if (!is.null(seed)) set.seed(seed + 100000 + r)
-    init_th <- rnorm(p_full + 1, 0, 0.1)
+    if (r == 1 && !is.null(init_theta) && length(init_theta) == p_full + 1) {
+      init_th <- init_theta
+    } else {
+      if (!is.null(seed)) set.seed(seed + 100000 + r)
+      init_th <- rnorm(p_full + 1, 0, 0.1)
+    }
     m <- loss_shift_classifier_all(
       X, y, base_loss, style, kernel,
       sigma = bp$sigma, alpha = bp$alpha, eta = bp$eta, lambda = bp$lambda,
       max_iter = max_iter, svm_dual = svm_dual,
       line_search = line_search, step_set = step_set,
       init_theta = init_th, verbose = verbose,
-      standardize_gaussian = TRUE)
+      standardize = TRUE)
     obj <- .compute_obj_for_model(m, X, y)
     if (obj < best_obj) { best_obj <- obj; best_mod <- m }
   }
@@ -500,10 +550,10 @@ train_loss_shift <- function(
     base_loss = c("hinge", "sqhinge", "logistic", "exp"),
     style     = c("none", "soft", "hard"),
     kernel    = c("linear", "gaussian"),
-    lambda_grid = 10^seq(-3, 1, len = 5),
-    sigma_grid  = NULL,                 # ignored for gaussian
-    alpha_grid  = c(0.5, 1, 2),
-    eta_grid    = c(0.1, 0.5, 1),
+    lambda_grid = 2^seq(-5, 2, len = 6),
+    sigma_grid  = NULL,              # ignored for gaussian
+    alpha_grid  = c(0.25, 0.5, 1, 2),
+    eta_grid    = c(0.1, 0.25, 0.5, 1),
     restarts    = 5,
     n_folds     = 5,
     svm_dual    = FALSE,
@@ -512,7 +562,9 @@ train_loss_shift <- function(
     step_set    = 2^c(-2, -1, 0, 1),
     verbose     = FALSE,
     seed        = NULL,
-    sigma_mult  = c(0.5,1,2)) {
+    sigma_mult  = c(0.5,1,2),
+    pre_trained_initial_params = NULL # <--- 'warm_start_params'에서 변경
+) {
   
   base_loss <- match.arg(base_loss)
   style     <- match.arg(style)
@@ -534,8 +586,25 @@ train_loss_shift <- function(
   p_full <- if (kernel == "gaussian") nrow(X_train) else ncol(X_train)
   best_model <- NULL; best_obj <- Inf
   for (r in seq_len(restarts)) {
-    if (!is.null(seed)) set.seed(seed + 200000 + r)
-    init_th <- rnorm(p_full + 1, 0, 0.1)
+    init_th <- NULL
+    # 첫 번째 restart이고, 사전 학습된 초기값이 제공된 경우에만 사용
+    if (r == 1 && !is.null(pre_trained_initial_params)) {
+      if (verbose) message("--> [Restart 1] Applying pre-trained initial parameters.")
+      # w(가중치)와 b(편향)를 합쳐서 theta 생성
+      init_th <- c(pre_trained_initial_params$b, as.vector(pre_trained_initial_params$w))
+      
+      # 차원이 맞지 않으면 경고 후 랜덤 초기값 사용
+      if (length(init_th) != p_full + 1) {
+        warning("Pre-trained initial parameters dimension mismatch. Reverting to random init.", call. = FALSE)
+        init_th <- NULL
+      }
+    }
+    
+    # 사전 학습된 초기값을 사용하지 않거나, 두 번째 이후의 restart인 경우
+    if (is.null(init_th)) {
+      if (!is.null(seed)) set.seed(seed + 200000 + r)
+      init_th <- rnorm(p_full + 1, 0, 0.1)
+    }
     m <- loss_shift_classifier_all(
       X_train, y_train,
       base_loss = base_loss, style = style, kernel = kernel,
@@ -543,7 +612,7 @@ train_loss_shift <- function(
       max_iter = max_iter, svm_dual = svm_dual,
       line_search = line_search, step_set = step_set,
       init_theta = init_th, verbose = verbose,
-      standardize_gaussian = TRUE)
+      standardize = TRUE)
     obj <- .compute_obj_for_model(m, X_train, y_train)
     if (obj < best_obj) { best_obj <- obj; best_model <- m }
   }

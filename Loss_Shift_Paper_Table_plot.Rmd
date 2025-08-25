@@ -1,0 +1,217 @@
+---
+title: "data_table"
+author: "Taenyoung Lee"
+date: "2025-08-17"
+output: html_document
+---
+
+
+```{r}
+# 필요한 라이브러리를 로드합니다.
+library(tidyverse)
+library(stringr)
+
+# 1. 데이터 불러오기 및 전처리 (이전과 동일)
+file_path <- "C:/Users/Tae/Downloads/0815_asymflip_table_parallel.csv"
+df <- read_csv(file_path)
+
+extract_mean <- function(x) {
+  as.numeric(str_extract(x, "^[0-9.]+"))
+}
+
+df_processed <- df %>%
+  mutate(across(-c(n, p, rate_pos, rate_neg), extract_mean))
+
+df_long <- df_processed %>%
+  pivot_longer(
+    cols = -c(n, p, rate_pos, rate_neg),
+    names_to = "method",
+    values_to = "accuracy"
+  )
+
+# 2. 시각화 데이터 준비 (이전과 동일)
+df_plot_data <- df_long %>%
+  filter(rate_neg == 0, rate_pos != 0)
+
+df_plot_data <- df_plot_data %>%
+  mutate(
+    loss_family = case_when(
+      str_starts(method, "hinge") ~ "Hinge",
+      str_starts(method, "sqhinge") ~ "Sqhinge",
+      str_starts(method, "logistic") ~ "Logistic",
+      str_starts(method, "exp") ~ "Exp",
+      TRUE ~ "Comparison"
+    )
+  )
+
+# 3. ★★★★★ 8개의 플롯을 각각 생성하고 저장 ★★★★★
+
+# 루프를 돌릴 리스트 정의
+loss_families <- c("Hinge", "Sqhinge", "Logistic", "Exp")
+n_values <- c(200, 400)
+# 비교군 데이터 미리 준비
+comparison_data <- df_plot_data %>% filter(loss_family == "Comparison")
+
+# 이중 for 루프를 사용하여 각 조합에 대한 플롯을 개별적으로 생성
+for (family in loss_families) {
+  for (n_val in n_values) {
+    
+    # 현재 루프의 손실 함수 그룹과 n값에 해당하는 데이터 필터링
+    current_plot_data <- bind_rows(
+      df_plot_data %>% filter(loss_family == family, n == n_val),
+      comparison_data %>% filter(n == n_val)
+    )
+    
+    # ggplot 객체 생성
+    # 이제 n값이 고정되었으므로 linetype, shape은 method 구분에만 사용
+    p <- ggplot(current_plot_data, aes(
+        x = rate_pos, 
+        y = accuracy, 
+        color = method, 
+        shape = method # linetype 대신 shape만 사용해도 충분히 구분됩니다.
+      )) +
+      geom_line(alpha = 0.8) +
+      geom_point(size = 3, alpha = 0.8) +
+      labs(
+        title = paste("Accuracy vs. Positive Rate for", family, "Loss"),
+        subtitle = paste("n =", n_val, "and rate_pos > 0"),
+        x = "Positive Rate (rate_pos)",
+        y = "Accuracy",
+        color = "Method",
+        shape = "Method"
+      ) +
+      theme_bw(base_size = 12) +
+      scale_color_viridis_d() +
+      theme(legend.position = "bottom")
+    
+    # 동적 파일 이름으로 플롯 저장 (n 값 포함)
+    file_name <- paste0("accuracy_vs_rate_pos_", tolower(family), "_n", n_val, ".png")
+    ggsave(file_name, plot = p, width = 11, height = 8)
+    
+    # 콘솔에 저장된 파일 이름 출력 (확인용)
+    print(paste("Saved plot:", file_name))
+  }
+}
+```
+
+```{r}
+# 필요한 라이브러리를 로드합니다.
+library(tidyverse)
+library(stringr)
+
+df <- read_csv(file_path)
+
+extract_mean <- function(x) {
+  as.numeric(str_extract(x, "^[0-9.]+"))
+}
+
+df_processed <- df %>%
+  mutate(across(-c(n, p, rate_pos, rate_neg), extract_mean))
+
+df_long <- df_processed %>%
+  pivot_longer(
+    cols = -c(n, p, rate_pos, rate_neg),
+    names_to = "method",
+    values_to = "accuracy"
+  )
+
+# 2. 시각화 데이터 준비 (이전과 동일)
+df_plot_data <- df_long %>%
+  filter(rate_neg == 0, rate_pos != 0)
+
+df_plot_data <- df_plot_data %>%
+  mutate(
+    loss_family = case_when(
+      str_starts(method, "hinge") ~ "Hinge",
+      str_starts(method, "sqhinge") ~ "Sqhinge",
+      str_starts(method, "logistic") ~ "Logistic",
+      str_starts(method, "exp") ~ "Exp",
+      TRUE ~ "Comparison"
+    )
+  )
+
+# 3. ★★★★★ 그룹별 스타일을 적용한 8개 플롯 생성 (에러 수정) ★★★★★
+
+# 루프를 돌릴 리스트 정의
+loss_families <- c("Hinge", "Sqhinge", "Logistic", "Exp")
+n_values <- c(200, 400)
+comparison_methods <- c("e1071_hard", "e1071_soft", "glm", "glmnet")
+
+# 이중 for 루프를 사용하여 각 조합에 대한 플롯을 개별적으로 생성
+for (family in loss_families) {
+  for (n_val in n_values) {
+    
+    # 현재 family에 해당하는 메소드 이름들을 정의
+    family_methods <- c(
+      paste0(tolower(family), "_none"),
+      paste0(tolower(family), "_soft"),
+      paste0(tolower(family), "_hard")
+    )
+    
+    # 플로팅할 전체 메소드 리스트
+    methods_to_plot <- c("true", family_methods, comparison_methods)
+    
+    # 현재 조합에 해당하는 데이터 필터링
+    current_plot_data <- df_plot_data %>%
+      filter(n == n_val, method %in% methods_to_plot)
+
+    # --- 스타일 수동 지정 (setNames 방식으로 수정) ---
+    
+    # 1. 색상 팔레트 설정
+    color_names <- c("true", family_methods, comparison_methods)
+    color_values <- c(
+      "black",   # true
+      "#0D47A1", # family_none (Dark Blue)
+      "#1976D2", # family_soft (Medium Blue)
+      "#42A5F5", # family_hard (Light Blue)
+      "#BDBDBD", # e1071_hard (Light Grey)
+      "#9E9E9E", # e1071_soft (Medium-Light Grey)
+      "#757575", # glm (Medium Grey)
+      "#616161"  # glmnet (Dark Grey)
+    )
+    colors <- setNames(color_values, color_names)
+    
+    # 2. 선 종류 설정
+    linetype_names <- c("true", family_methods, comparison_methods)
+    linetype_values <- c(
+      "solid",  # true
+      "solid", "solid", "solid", # family methods
+      "dashed", "dashed", # e1071
+      "dotted", "dotted"  # glm, glmnet
+    )
+    linetypes <- setNames(linetype_values, linetype_names)
+    
+    # 3. 선 굵기 설정
+    size_names <- c("true", family_methods, comparison_methods)
+    size_values <- c(
+      1.2, # true
+      1.0, 1.0, 1.0, # family methods
+      0.8, 0.8, 0.8, 0.8 # comparison
+    )
+    sizes <- setNames(size_values, size_names)
+
+    # ggplot 객체 생성
+    p <- ggplot(current_plot_data, aes(x = rate_pos, y = accuracy, color = method, linetype = method)) +
+      geom_line(aes(linewidth = method)) +
+      geom_point(size = 3, alpha = 0.7) +
+      scale_color_manual(values = colors) +
+      scale_linetype_manual(values = linetypes) +
+      scale_linewidth_manual(values = sizes) +
+      labs(
+        title = paste("Accuracy vs. Positive Rate for", family, "Loss"),
+        subtitle = paste("n =", n_val, "| rate_pos > 0"),
+        x = "Positive Rate (rate_pos)",
+        y = "Accuracy"
+      ) +
+      theme_bw(base_size = 14) +
+      theme(legend.title = element_blank(), legend.position = "bottom")
+
+    # 파일 저장
+    file_name <- paste0("final_plot_v2_", tolower(family), "_n", n_val, ".png")
+    ggsave(file_name, plot = p, width = 11, height = 8)
+    
+    print(paste("Saved final plot:", file_name))
+  }
+}
+```
+
