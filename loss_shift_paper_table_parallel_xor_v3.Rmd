@@ -1,0 +1,264 @@
+---
+title: "loss_shift_paper_table_parallel_xor"
+output: html_document
+date: "2025-08-17"
+---
+
+```{r}
+source('discord_alarm.r')
+```
+
+```{r}
+## ───────────────────────────────────────────────────────────────────
+##  의존성 패키지 로드
+## ───────────────────────────────────────────────────────────────────
+suppressPackageStartupMessages({
+  library(e1071)
+  library(tidyr)
+  library(dplyr)
+  library(knitr)
+  library(kableExtra)
+  library(future)
+  library(future.apply)
+  library(progressr)
+})
+
+## ───────────────────────────────────────────────────────────────────
+## 1) 표 컬럼 정의 (glm, glmnet 제외)
+## ───────────────────────────────────────────────────────────────────
+TABLE_COLS <- c(
+  "n","p","rate_pos","rate_neg","true",
+  "hinge_none","sqhinge_none","logistic_none","exp_none",
+  "hinge_soft","sqhinge_soft","logistic_soft","exp_soft",
+  "hinge_hard","sqhinge_hard","logistic_hard","exp_hard",
+  "e1071" # glm, glmnet 제거
+)
+DISPLAY_NAMES <- c(
+  "n","p","rate_pos","rate_neg","true",
+  "hinge-none","sqhinge-none","logistic-none","exp-none",
+  "hinge-soft","sqhinge-soft","logistic-soft","exp-soft",
+  "hinge-hard","sqhinge-hard","logistic-hard","exp-hard",
+  "e1071"
+)
+MODEL_COLS <- setdiff(TABLE_COLS, c("n","p","rate_pos","rate_neg","true"))
+
+# 정확도 계산 함수
+acc <- function(y_true, y_pred) mean(y_true == y_pred)
+
+## ───────────────────────────────────────────────────────────────────
+## 2) 데이터 생성 함수들
+## ───────────────────────────────────────────────────────────────────
+# XOR 데이터 생성
+gen_xor_2d <- function(n, p = 2, mu = 1, sd = 0.5, seed = NULL) {
+  stopifnot(p == 2)
+  if (!is.null(seed)) set.seed(seed)
+  
+  n_per_quad <- n %/% 4
+  n_rem <- n %% 4
+  ns <- rep(n_per_quad, 4) + c(rep(1, n_rem), rep(0, 4 - n_rem))
+
+  # Class +1: (mu, mu), (-mu, -mu)
+  X_p1 <- cbind(rnorm(ns[1], mean =  mu, sd = sd), rnorm(ns[1], mean =  mu, sd = sd))
+  X_p2 <- cbind(rnorm(ns[2], mean = -mu, sd = sd), rnorm(ns[2], mean = -mu, sd = sd))
+
+  # Class -1: (mu, -mu), (-mu, mu)
+  X_n1 <- cbind(rnorm(ns[3], mean =  mu, sd = sd), rnorm(ns[3], mean = -mu, sd = sd))
+  X_n2 <- cbind(rnorm(ns[4], mean = -mu, sd = sd), rnorm(ns[4], mean =  mu, sd = sd))
+
+  X <- rbind(X_p1, X_p2, X_n1, X_n2)
+  y <- c(rep(1, ns[1] + ns[2]), rep(-1, ns[3] + ns[4]))
+  
+  shuffle_idx <- sample(n)
+  list(X = X[shuffle_idx, ], y = y[shuffle_idx])
+}
+
+## ───────────────────────────────────────────────────────────────────
+## 3) 라벨 플립 함수
+## ───────────────────────────────────────────────────────────────────
+flip_labels_asym <- function(y, rate_pos = 0, rate_neg = 0, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  idx_p <- which(y ==  1); kp <- floor(length(idx_p) * rate_pos)
+  idx_n <- which(y == -1); kn <- floor(length(idx_n) * rate_neg)
+  flip_idx <- c(if (kp > 0) sample(idx_p, kp) else integer(0),
+                if (kn > 0) sample(idx_n, kn) else integer(0))
+  y2 <- y; if (length(flip_idx)) y2[flip_idx] <- -y2[flip_idx]
+  list(y = y2, flipped_idx = flip_idx)
+}
+
+## ───────────────────────────────────────────────────────────────────
+## 4) 외부 모델 래퍼 (e1071)
+## ───────────────────────────────────────────────────────────────────
+pred_e1071 <- function(Xtr, ytr, Xte, kernel = "linear", cost = 1.0) {
+  y_fac <- factor(ifelse(ytr > 0, "pos", "neg"))
+  fit <- e1071::svm(x = Xtr, y = y_fac, kernel = kernel,
+                    type = "C-classification", cost = cost, scale = FALSE)
+  pr <- predict(fit, Xte)
+  ifelse(pr == "pos", 1, -1)
+}
+
+
+## ───────────────────────────────────────────────────────────────────
+## 5) 조합(에러율x모델) 병렬 실행을 위한 핵심 함수들
+## ───────────────────────────────────────────────────────────────────
+
+# 헬퍼 함수: 모델 1개를 실행하는 최소 작업 단위
+run_single_model <- function(model_name, Xtr, ytr, Xte, kernel) {
+  pred <- switch(
+    model_name,
+    "e1071" = pred_e1071(Xtr, ytr, Xte, kernel = kernel, cost = 1.0),
+    {
+      # Loss-shifting 모델 (이름 파싱: "hinge_none" -> base_loss="hinge", style="none")
+      parts <- strsplit(model_name, "_")[[1]]
+      res <- train_loss_shift(
+        X_train = Xtr, y_train = ytr, X_test = Xte,
+        base_loss = parts[1], style = parts[2], kernel = "gaussian",
+        restarts = 10, n_folds = 3, svm_dual = TRUE,
+        max_iter = 100, line_search = TRUE, verbose = FALSE
+      )
+      res$test_pred
+    }
+  )
+  return(pred)
+}
+
+# 메인 함수: k회 반복을 순차적으로 돌면서, 각 반복 내부의 조합들을 병렬 처리
+run_grid_combined_parallel <- function(n_train, n_test, rates_pos, rates_neg,
+                                       data_gen_fun, oracle_fun, kernel = "linear",
+                                       k = 20, seed = 2025, digits = 3) {
+  p <- 2
+  plan(multisession)
+  
+  final_results_df <- data.frame()
+
+  cat(sprintf("Total %d repetitions to run sequentially.\n", k))
+
+  # k번의 반복은 순차적 실행 (외부 루프)
+  for (i in 1:k) {
+    cat(sprintf("\n--- Repetition %d/%d ---\n", i, k))
+    
+    # 1. 데이터 1회 생성
+    current_seed <- seed + i
+    set.seed(current_seed)
+    Tr <- data_gen_fun(n_train, seed = current_seed + 1)
+    Te <- data_gen_fun(n_test,  seed = current_seed + 2)
+    Xtr <- Tr$X; ytr_clean <- Tr$y
+    Xte <- Te$X; yte_true  <- Te$y
+    
+    # 2. 병렬 처리할 작업 그리드 생성 (에러율 x 모델)
+    task_grid <- expand.grid(
+      rate_pos = rates_pos,
+      rate_neg = rates_neg,
+      model = MODEL_COLS, # true 제외
+      stringsAsFactors = FALSE
+    )
+    
+    # 3. 병렬 실행 (내부 루프)
+    with_progress({
+      p_bar <- progressor(steps = nrow(task_grid))
+      
+      accuracies <- future_lapply(1:nrow(task_grid), function(j) {
+        task_rate_pos <- task_grid$rate_pos[j]
+        task_rate_neg <- task_grid$rate_neg[j]
+        task_model <- task_grid$model[j]
+        
+        ytr <- flip_labels_asym(
+          ytr_clean, rate_pos = task_rate_pos, rate_neg = task_rate_neg,
+          seed = current_seed + 3
+        )$y
+        
+        y_pred <- run_single_model(task_model, Xtr, ytr, Xte, kernel)
+        
+        p_bar(sprintf("model=%s, rp=%.2f", task_model, task_rate_pos))
+        acc(yte_true, y_pred)
+      }, future.seed = TRUE)
+    })
+    
+    # 4. 결과 정리
+    task_grid$accuracy <- unlist(accuracies)
+    
+    pred_true_oracle <- oracle_fun(Xte)
+    true_acc <- acc(yte_true, pred_true_oracle)
+
+    results_wide <- task_grid %>%
+      pivot_wider(names_from = model, values_from = accuracy) %>%
+      mutate(true = true_acc, .after = rate_neg)
+      
+    final_results_df <- rbind(final_results_df, results_wide)
+  }
+  
+  # 5. k회 반복 결과에 대한 평균 및 표준편차 계산
+  cat("\n--- All repetitions complete. Aggregating results. ---\n")
+  
+  agg_results <- final_results_df %>%
+    group_by(rate_pos, rate_neg) %>%
+    summarise(across(all_of(TABLE_COLS[-(1:4)]), # n,p,rate_pos,rate_neg 제외
+                     list(mean = mean, sd = sd)), .groups = 'drop')
+
+  # "평균 (표준편차)" 포맷으로 변환
+  formatted_df <- data.frame(n = n_train, p = p, rate_pos = agg_results$rate_pos, rate_neg = agg_results$rate_neg)
+  for (col in setdiff(TABLE_COLS, c("n","p","rate_pos","rate_neg"))) {
+    mean_col <- paste0(col, "_mean")
+    sd_col <- paste0(col, "_sd")
+    # sd가 없는 경우(k=1) NA 방지
+    sd_vals <- ifelse(is.na(agg_results[[sd_col]]), 0, agg_results[[sd_col]])
+    formatted_df[[col]] <- sprintf("%.*f (%.*f)", digits, agg_results[[mean_col]], digits, sd_vals)
+  }
+  
+  return(formatted_df)
+}
+```
+
+
+```{r}
+## ───────────────────────────────────────────────────────────────────
+## 시뮬레이션 실행
+## ───────────────────────────────────────────────────────────────────
+
+# 1. 학습/예측 함수 로드 (train_loss_shift 함수가 포함된 파일)
+# 아래 파일 경로가 실제 위치와 맞는지 확인하세요.
+source("loss_shifting_v4.R") 
+
+# 2. 데이터셋별 오라클 함수 정의
+oracle_xor <- function(Xte) ifelse(Xte[,1] * Xte[,2] >= 0, 1, -1)
+
+# 3. 시뮬레이션 파라미터 설정
+N_VEC <- c(200)
+RATES_POS <- c(0.00, 0.05, 0.10, 0.15, 0.2)
+RATES_NEG <- c(0.00)
+N_TEST <- 400
+K_REPS <- 30
+SEED <- 20250910
+DIGITS <- 5
+
+# 4. 시뮬레이션 실행
+cat("\n--- Running Scenario: XOR Data with RBF Kernel (Combined Parallel) ---\n")
+
+tbl_xor_rbf <- run_grid_combined_parallel(
+  n_train       = N_VEC[1],
+  rates_pos     = RATES_POS,
+  rates_neg     = RATES_NEG,
+  n_test        = N_TEST,
+  data_gen_fun  = gen_xor_2d,
+  oracle_fun    = oracle_xor,
+  kernel        = "radial",      # e1071 SVM에 적용될 커널
+  k             = K_REPS,
+  seed          = SEED,
+  digits        = DIGITS
+)
+
+tbl_xor_rbf$scenario <- "XOR (RBF Kernel)"
+
+# 5. 결과 저장 및 출력
+final_results <- tbl_xor_rbf
+final_results <- final_results[, c("scenario", setdiff(names(final_results), "scenario"))]
+write.csv(final_results, "0910_results_combined_parallel.csv", row.names = FALSE)
+
+# 콘솔에 결과 출력
+print(final_results)
+
+# 알람 (필요 시 사용)
+send_alarm(TRUE)
+
+```
+
+
