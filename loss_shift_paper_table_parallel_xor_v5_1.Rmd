@@ -55,20 +55,27 @@ flip_labels_asym <- function(y, rate_pos = 0, rate_neg = 0, seed = NULL) {
   flip_idx <- c(if(kp>0) sample(idx_p,kp) else integer(0), if(kn>0) sample(idx_n,kn) else integer(0))
   y2 <- y; if(length(flip_idx)) y2[flip_idx] <- -y2[flip_idx]; list(y=y2, flipped_idx=flip_idx)
 }
-pred_e1071_tuned <- function(Xtr, ytr, Xte, kernel = "radial", seed = NULL) {
+
+# [NEW] 공정 비교를 위해 C 그리드와 동점 처리를 수정한 SVM 함수
+pred_e1071_aligned <- function(Xtr, ytr, Xte, kernel = "radial", seed = NULL) {
   y_fac <- factor(ifelse(ytr > 0, "pos", "neg"))
 
-  if (kernel != "radial") { # Fallback for linear kernel
+  if (kernel != "radial") { # 선형 커널은 기존 방식 유지
     fit <- e1071::svm(x = Xtr, y = y_fac, kernel = "linear", type = "C-classification", cost = 1.0, scale = FALSE)
   } else {
-    # Define hyperparameter grids consistent with loss_shifting
-    # sigma -> gamma conversion: gamma = 1 / (2 * sigma^2)
+    n <- nrow(Xtr)
+    if (!is.null(seed)) set.seed(seed)
+
+    # 1. loss_shift와 정렬된 하이퍼파라미터 그리드 생성
+    # Sigma -> Gamma 그리드
     sigma_grid <- .sigma_grid_from_median_scaled(Xtr, sigma_mult = c(0.5, 1, 2), seed = seed)
     gamma_grid <- 1 / (2 * sigma_grid^2)
-    cost_grid <- 2^seq(-2, 5, len = 6)
 
-    # Use tune() to perform 3-fold CV
-    if (!is.null(seed)) set.seed(seed)
+    # Lambda -> C(cost) 그리드
+    lambda_grid <- 2^seq(-5, 2, length.out = 6)
+    cost_grid <- 1 / (2 * n * lambda_grid + 1e-10) # 0으로 나누는 것을 방지
+
+    # 2. e1071::tune으로 모든 그리드 조합의 성능 측정
     tuned <- e1071::tune(
       svm,
       train.x = Xtr, train.y = y_fac,
@@ -76,9 +83,21 @@ pred_e1071_tuned <- function(Xtr, ytr, Xte, kernel = "radial", seed = NULL) {
       ranges = list(gamma = gamma_grid, cost = cost_grid),
       tunecontrol = tune.control(cross = 3)
     )
-    
-    # Train final model with best parameters
-    fit <- tuned$best.model
+
+    # 3. 직접 동점자 처리 규칙을 적용하여 최적 파라미터 선택
+    perf_df <- tuned$performances
+    best_error <- min(perf_df$error, na.rm = TRUE)
+    ties <- perf_df[perf_df$error == best_error, ]
+
+    # 정렬: 1) 작은 cost(큰 lambda) 우선, 2) 작은 gamma(큰 sigma) 우선
+    sorted_ties <- ties[order(ties$cost, ties$gamma), ]
+    best_params <- sorted_ties[1, ]
+
+    # 4. 최종 모델을 최적 파라미터로 다시 학습
+    fit <- e1071::svm(
+      x = Xtr, y = y_fac, kernel = "radial", type = "C-classification",
+      cost = best_params$cost, gamma = best_params$gamma, scale = FALSE
+    )
   }
 
   pr <- predict(fit, Xte)
@@ -162,14 +181,14 @@ pred_glm_kernel <- function(Xtr, ytr, Xte, seed = NULL) {
 
 run_single_model <- function(model_name, Xtr, ytr, Xte, kernel) {
   switch(model_name,
-    "e1071" = pred_e1071_tuned(Xtr, ytr, Xte, kernel = kernel), # Call tuned e1071
+    "e1071" = pred_e1071_aligned(Xtr, ytr, Xte, kernel = kernel),
     "glm"   = pred_glm_kernel(Xtr, ytr, Xte),               # Call kernelized glm
     {
       parts <- strsplit(model_name, "_")[[1]]
       res <- train_loss_shift(
         X_train = Xtr, y_train = ytr, X_test = Xte,
         base_loss = parts[1], style = parts[2], kernel = "gaussian",
-        restarts = 10, n_folds = 3, svm_dual = TRUE, max_iter = 100,
+        restarts = 5, n_folds = 3, svm_dual = TRUE, max_iter = 100,
         line_search = TRUE, verbose = FALSE
       )
       res$test_pred
