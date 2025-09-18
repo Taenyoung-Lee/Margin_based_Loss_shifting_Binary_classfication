@@ -1,0 +1,315 @@
+---
+title: "xor"
+author: "Taenyoung Lee"
+date: "2025-09-18"
+output: html_document
+---
+
+```{r}
+## ───────────────────────────────────────────────────────────────────
+##  의존성 패키지 로드 (동일)
+## ───────────────────────────────────────────────────────────────────
+suppressPackageStartupMessages({
+  library(e1071)
+  library(tidyr)
+  library(dplyr)
+  library(knitr)
+  library(kableExtra)
+  library(future)
+  library(future.apply)
+  library(progressr)
+})
+
+## ───────────────────────────────────────────────────────────────────
+## 1) 표 컬럼 정의 (동일)
+## ───────────────────────────────────────────────────────────────────
+TABLE_COLS <- c(
+  "n","p","rate_pos","rate_neg","true",
+  "hinge_none","sqhinge_none","logistic_none","exp_none",
+  "hinge_soft","sqhinge_soft","logistic_soft","exp_soft",
+  "hinge_hard","sqhinge_hard","logistic_hard","exp_hard",
+  "e1071", "glm"
+)
+MODEL_COLS <- setdiff(TABLE_COLS, c("n","p","rate_pos","rate_neg","true"))
+acc <- function(y_true, y_pred) mean(y_true == y_pred)
+
+## ───────────────────────────────────────────────────────────────────
+## 2) 데이터/노이즈 (동일)
+## ───────────────────────────────────────────────────────────────────
+gen_xor_2d <- function(n, p = 2, mu = 1, sd = 0.5, seed = NULL) {
+  stopifnot(p == 2)
+  if (!is.null(seed)) set.seed(seed)
+  n_per_quad <- n %/% 4; n_rem <- n %% 4
+  ns <- rep(n_per_quad, 4) + c(rep(1, n_rem), rep(0, 4 - n_rem))
+  X_p1 <- cbind(rnorm(ns[1], mean=mu, sd=sd), rnorm(ns[1], mean=mu, sd=sd))
+  X_p2 <- cbind(rnorm(ns[2], mean=-mu, sd=sd), rnorm(ns[2], mean=-mu, sd=sd))
+  X_n1 <- cbind(rnorm(ns[3], mean=mu, sd=sd), rnorm(ns[3], mean=-mu, sd=sd))
+  X_n2 <- cbind(rnorm(ns[4], mean=-mu, sd=sd), rnorm(ns[4], mean=mu, sd=sd))
+  X <- rbind(X_p1, X_p2, X_n1, X_n2); y <- c(rep(1, ns[1]+ns[2]), rep(-1, ns[3]+ns[4]))
+  shuffle_idx <- sample(n); list(X = X[shuffle_idx, ], y = y[shuffle_idx])
+}
+flip_labels_asym <- function(y, rate_pos = 0, rate_neg = 0, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  idx_p <- which(y==1); kp <- floor(length(idx_p)*rate_pos)
+  idx_n <- which(y==-1); kn <- floor(length(idx_n)*rate_neg)
+  flip_idx <- c(if(kp>0) sample(idx_p,kp) else integer(0), if(kn>0) sample(idx_n,kn) else integer(0))
+  y2 <- y; if(length(flip_idx)) y2[flip_idx] <- -y2[flip_idx]; list(y=y2, flipped_idx=flip_idx)
+}
+
+## ───────────────────────────────────────────────────────────────────
+## 3) loss_shifting_v4 기준 정렬용 유틸 (신규)
+## ───────────────────────────────────────────────────────────────────
+.zfit <- function(X){
+  mu <- colMeans(X); sd <- apply(X,2,sd); sd[sd==0] <- 1
+  list(mu=mu, sd=sd, Xs = sweep(sweep(X,2,mu,"-"),2,sd,"/"))
+}
+.zapply <- function(X, mu, sd){
+  sd[sd==0] <- 1; sweep(sweep(X,2,mu,"-"),2,sd,"/")
+}
+
+# train_loss_shift 기본 λ 그리드와 동일한 철학
+lambda_grid_default <- 2^seq(-5, 2, length.out = 6)
+# loss_shifting_v4 의 sigma_mult 기본
+sigma_mult_default  <- c(0.5, 1, 2)
+
+# 주의: 아래 함수는 loss_shifting_v4.R 에 정의됨 (source 후 사용)
+# .sigma_grid_from_median_scaled(X, sigma_mult = c(0.5,1,2), ...)
+
+## ───────────────────────────────────────────────────────────────────
+## 4) e1071 SVM: λ-그리드 기준 C=1/(2 n λ), σ(z-score)→γ, tie-break 정렬 (신규)
+## ───────────────────────────────────────────────────────────────────
+cv_svm_e1071_aligned <- function(X, y, k=3,
+                                 lambda_grid = lambda_grid_default,
+                                 sigma_mult  = sigma_mult_default,
+                                 kernel="radial", seed=NULL) {
+  stopifnot(kernel %in% c("radial","linear","polynomial","sigmoid"))
+  if (!is.null(seed)) set.seed(seed)
+
+  # 표준화 + σ 그리드 (loss_shifting_v4 와 동일)
+  z <- .zfit(X); Xs <- z$Xs
+  sigma_grid <- .sigma_grid_from_median_scaled(Xs, sigma_mult = sigma_mult, seed = seed)
+  gamma_grid <- if (kernel=="radial") 1/(2*sigma_grid^2) else NA_real_
+
+  # C 그리드: C = 1/(2 n λ)
+  n <- nrow(X); C_grid <- 1/(2 * n * lambda_grid)
+
+  # K-fold
+  folds <- lapply(1:k, function(i) which(sample(rep(1:k, length.out=n))==i))
+
+  # 조합 탐색
+  combos <- expand.grid(C = C_grid,
+                        gamma = if (kernel=="radial") gamma_grid else NA_real_,
+                        sigma = if (kernel=="radial") sigma_grid else NA_real_,
+                        KEEP.OUT.ATTRS = FALSE)
+
+  scores <- numeric(nrow(combos))
+  for (row in seq_len(nrow(combos))) {
+    Cval <- combos$C[row]; gval <- combos$gamma[row]
+    fold_acc <- c()
+    for (i in seq_along(folds)) {
+      te <- folds[[i]]; tr <- setdiff(seq_len(n), te)
+      fit <- e1071::svm(
+        x = Xs[tr,], y = factor(ifelse(y[tr]>0,"pos","neg")),
+        kernel=kernel, type="C-classification",
+        cost=Cval, gamma=if (kernel=="radial") gval else 0.0,
+        scale=FALSE
+      )
+      pr <- predict(fit, Xs[te,])
+      fold_acc[i] <- mean(ifelse(pr=="pos",1,-1) == y[te])
+    }
+    scores[row] <- mean(fold_acc)
+  }
+
+  # tie-break: 큰 λ(=작은 C) 우선, (가우시안이면) 큰 σ 우선
+  best <- which(scores == max(scores))
+  if (length(best) > 1) {
+    ord <- order(combos$C[best], -combos$sigma[best], method="radix")
+    best <- best[ord[1]]
+  }
+
+  list(
+    best_C = combos$C[best],
+    best_gamma = if (kernel=="radial") combos$gamma[best] else NULL,
+    z_mu = z$mu, z_sd = z$sd
+  )
+}
+
+pred_e1071 <- function(Xtr, ytr, Xte, kernel="radial",
+                       lambda_grid = lambda_grid_default,
+                       sigma_mult = sigma_mult_default,
+                       kfold=3, seed=NULL) {
+  z <- .zfit(Xtr); Xtr_s <- z$Xs; Xte_s <- .zapply(Xte, z$mu, z$sd)
+
+  sel <- cv_svm_e1071_aligned(Xtr, ytr, k=kfold,
+                               lambda_grid=lambda_grid,
+                               sigma_mult=sigma_mult,
+                               kernel=kernel, seed=seed)
+
+  fit <- e1071::svm(
+    x=Xtr_s, y=factor(ifelse(ytr>0,"pos","neg")),
+    kernel=kernel, type="C-classification",
+    cost=sel$best_C,
+    gamma=if (kernel=="radial") sel$best_gamma else 0.0,
+    scale=FALSE
+  )
+  pr <- predict(fit, Xte_s)
+  ifelse(pr=="pos",1,-1)
+}
+
+## ───────────────────────────────────────────────────────────────────
+## 5) GLM 대체: RFF(커널 특징) + 로지스틱, γ CV & tie-break (신규)
+## ───────────────────────────────────────────────────────────────────
+rff_features <- function(X, gamma, D=500, seed=NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  p <- ncol(X)
+  Omega <- matrix(rnorm(p*D, sd=sqrt(2*gamma)), nrow=p, ncol=D)
+  b <- runif(D, 0, 2*pi)
+  sqrt(2/D) * cos(X %*% Omega + matrix(rep(b, each=nrow(X)), nrow=nrow(X)))
+}
+
+pred_glm <- function(Xtr, ytr, Xte,
+                     sigma_mult = sigma_mult_default,
+                     D=500, kfold=3, seed=NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  # 표준화
+  z <- .zfit(Xtr); Xtr_s <- z$Xs; Xte_s <- .zapply(Xte, z$mu, z$sd)
+
+  # σ 그리드(동일), γ 변환
+  sigma_grid <- .sigma_grid_from_median_scaled(Xtr_s, sigma_mult = sigma_mult, seed = seed)
+  gamma_grid <- 1/(2*sigma_grid^2)
+
+  y01 <- ifelse(ytr>0,1,0)
+  n <- nrow(Xtr_s)
+  folds <- lapply(1:kfold, function(i) which(sample(rep(1:kfold, length.out=n))==i))
+
+  # γ CV (tie-break: 큰 σ(=작은 γ) 우선)
+  accs <- numeric(length(gamma_grid))
+  for (gi in seq_along(gamma_grid)) {
+    g <- gamma_grid[gi]
+    fold_acc <- c()
+    for (i in seq_along(folds)) {
+      te <- folds[[i]]; tr <- setdiff(seq_len(n), te)
+      Zi <- rff_features(Xtr_s[tr,], gamma=g, D=D, seed=seed+123)
+      Zt <- rff_features(Xtr_s[te,],  gamma=g, D=D, seed=seed+123)
+      fit <- glm(y ~ . , data=data.frame(y=y01[tr], Zi), family=binomial("logit"))
+      ph  <- predict(fit, data.frame(Zt), type="response")
+      fold_acc[i] <- mean(ifelse(ph>0.5,1,0) == y01[te])
+    }
+    accs[gi] <- mean(fold_acc)
+  }
+  best_idx <- which(accs == max(accs))
+  if (length(best_idx) > 1) {
+    best_idx <- best_idx[order(gamma_grid[best_idx], method="radix")] # 작은 γ(=큰 σ) 우선
+  }
+  g_best <- gamma_grid[best_idx[1]]
+
+  Ztr <- rff_features(Xtr_s, gamma=g_best, D=D, seed=seed+123)
+  Zte <- rff_features(Xte_s, gamma=g_best, D=D, seed=seed+123)
+  fit <- glm(y01 ~ . , data=data.frame(y01=y01, Ztr), family=binomial("logit"))
+  ph  <- predict(fit, data.frame(Zte), type="response")
+  ifelse(ph>0.5,1,-1)
+}
+
+## ───────────────────────────────────────────────────────────────────
+## 6) 모델 실행 스위치 (수정)
+## ───────────────────────────────────────────────────────────────────
+run_single_model <- function(model_name, Xtr, ytr, Xte, kernel) {
+  switch(model_name,
+    "e1071" = pred_e1071(Xtr, ytr, Xte, kernel=kernel,
+                         lambda_grid=lambda_grid_default,
+                         sigma_mult=sigma_mult_default,
+                         kfold=3, seed=12345),
+    "glm"   = pred_glm(Xtr, ytr, Xte,
+                       sigma_mult=sigma_mult_default,
+                       D=500, kfold=3, seed=12345),
+    { parts <- strsplit(model_name, "_")[[1]];
+      res <- train_loss_shift(X_train=Xtr, y_train=ytr, X_test=Xte, base_loss=parts[1],
+                              style=parts[2], kernel="gaussian", restarts=10, n_folds=3,
+                              svm_dual=TRUE, max_iter=100, line_search=TRUE, verbose=FALSE);
+      res$test_pred })
+}
+
+## ───────────────────────────────────────────────────────────────────
+## 7) 시뮬레이션 함수/실행부 (원문 그대로 사용)
+## ───────────────────────────────────────────────────────────────────
+run_grid_fully_parallel <- function(n_train, n_test, rates_pos, rates_neg,
+                                    data_gen_fun, oracle_fun, kernel = "linear",
+                                    k = 20, seed = 2025, digits = 5) {
+  p <- 2
+  plan(multisession)
+
+  task_grid <- expand.grid(
+    rate_pos = rates_pos,
+    rate_neg = rates_neg,
+    rep_i = 1:k,
+    stringsAsFactors = FALSE
+  )
+  cat(sprintf("\n--- Running a total of %d independent simulations in parallel ---\n", nrow(task_grid)))
+
+  with_progress({
+    p_bar <- progressor(steps = nrow(task_grid))
+    results_list <- future_lapply(1:nrow(task_grid), function(j) {
+      current_rate_pos <- task_grid$rate_pos[j]
+      current_rate_neg <- task_grid$rate_neg[j]
+
+      current_seed <- seed + j
+      Tr <- data_gen_fun(n_train, seed = current_seed + 1)
+      Te <- data_gen_fun(n_test,  seed = current_seed + 2)
+
+      ytr_noisy <- flip_labels_asym(
+        Tr$y, rate_pos = current_rate_pos, rate_neg = current_rate_neg,
+        seed = current_seed + 3
+      )$y
+
+      accuracies <- sapply(MODEL_COLS, function(model_name) {
+        y_pred <- run_single_model(model_name, Tr$X, ytr_noisy, Te$X, kernel)
+        acc(Te$y, y_pred)
+      })
+
+      true_acc <- acc(Te$y, oracle_fun(Te$X))
+      p_bar(sprintf("rp=%.2f", current_rate_pos))
+
+      c(rate_pos = current_rate_pos, rate_neg = current_rate_neg, accuracies, true = true_acc)
+    }, future.seed = TRUE)
+  })
+
+  cat("\n--- All simulations complete. Aggregating results. ---\n")
+  full_results_df <- bind_rows(lapply(results_list, as.list))
+  agg_results <- full_results_df %>%
+    group_by(rate_pos, rate_neg) %>%
+    summarise(across(all_of(c(MODEL_COLS, "true")), list(mean = mean, sd = sd)), .groups = 'drop')
+
+  formatted_df <- data.frame(n = n_train, p = p, rate_pos = agg_results$rate_pos, rate_neg = agg_results$rate_neg)
+  all_cols_ordered <- TABLE_COLS[-(1:4)]
+  for (col in all_cols_ordered) {
+    mean_col <- paste0(col, "_mean"); sd_col <- paste0(col, "_sd")
+    sd_vals <- ifelse(is.na(agg_results[[sd_col]]), 0, agg_results[[sd_col]])
+    formatted_df[[col]] <- sprintf("%.*f (%.*f)", digits, agg_results[[mean_col]], digits, sd_vals)
+  }
+  formatted_df
+}
+
+## ───────────────────────────────────────────────────────────────────
+## 8) 실행 (동일)
+## ───────────────────────────────────────────────────────────────────
+source("loss_shifting_v4.R")
+oracle_xor <- function(Xte) ifelse(Xte[,1] * Xte[,2] >= 0, 1, -1)
+
+N_VEC <- c(200); RATES_POS <- c(0.00, 0.05, 0.10, 0.15, 0.2); RATES_NEG <- c(0.00)
+N_TEST <- 400; K_REPS <- 10; SEED <- 20250910; DIGITS <- 5
+
+cat("\n--- Running Scenario: XOR Data with RBF Kernel (Fully Parallel Method) ---\n")
+
+tbl_xor_rbf <- run_grid_fully_parallel(
+  n_train       = N_VEC[1], rates_pos     = RATES_POS, rates_neg     = RATES_NEG,
+  n_test        = N_TEST, data_gen_fun  = gen_xor_2d, oracle_fun    = oracle_xor,
+  kernel        = "radial", k             = K_REPS, seed          = SEED, digits        = DIGITS
+)
+
+tbl_xor_rbf$scenario <- "XOR (RBF Kernel)"
+final_results <- tbl_xor_rbf[, c("scenario", setdiff(names(tbl_xor_rbf), "scenario"))]
+write.csv(final_results, "xor_0917.csv", row.names = FALSE)
+print(final_results)
+
+```
+

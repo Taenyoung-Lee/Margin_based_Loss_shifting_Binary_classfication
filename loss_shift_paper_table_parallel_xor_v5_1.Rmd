@@ -1,0 +1,275 @@
+---
+title: "xor"
+author: "Taenyong_Lee"
+date: "2025-09-16"
+output: html_document
+---
+
+```{r}
+## ───────────────────────────────────────────────────────────────────
+##  의존성 패키지 로드
+## ───────────────────────────────────────────────────────────────────
+suppressPackageStartupMessages({
+  library(e1071)
+  library(tidyr)
+  library(dplyr)
+  library(knitr)
+  library(kableExtra)
+  library(future)
+  library(future.apply)
+  library(progressr)
+})
+
+## ───────────────────────────────────────────────────────────────────
+## 1) 표 컬럼 정의
+## ───────────────────────────────────────────────────────────────────
+TABLE_COLS <- c(
+  "n","p","rate_pos","rate_neg","true",
+  "hinge_none","sqhinge_none","logistic_none","exp_none",
+  "hinge_soft","sqhinge_soft","logistic_soft","exp_soft",
+  "hinge_hard","sqhinge_hard","logistic_hard","exp_hard",
+  "e1071", "glm"
+)
+MODEL_COLS <- setdiff(TABLE_COLS, c("n","p","rate_pos","rate_neg","true"))
+acc <- function(y_true, y_pred) mean(y_true == y_pred)
+
+## ───────────────────────────────────────────────────────────────────
+## 2~4) Helper Functions (기존과 동일)
+## ───────────────────────────────────────────────────────────────────
+gen_xor_2d <- function(n, p = 2, mu = 1, sd = 0.5, seed = NULL) {
+  stopifnot(p == 2)
+  if (!is.null(seed)) set.seed(seed)
+  n_per_quad <- n %/% 4; n_rem <- n %% 4
+  ns <- rep(n_per_quad, 4) + c(rep(1, n_rem), rep(0, 4 - n_rem))
+  X_p1 <- cbind(rnorm(ns[1], mean=mu, sd=sd), rnorm(ns[1], mean=mu, sd=sd))
+  X_p2 <- cbind(rnorm(ns[2], mean=-mu, sd=sd), rnorm(ns[2], mean=-mu, sd=sd))
+  X_n1 <- cbind(rnorm(ns[3], mean=mu, sd=sd), rnorm(ns[3], mean=-mu, sd=sd))
+  X_n2 <- cbind(rnorm(ns[4], mean=-mu, sd=sd), rnorm(ns[4], mean=mu, sd=sd))
+  X <- rbind(X_p1, X_p2, X_n1, X_n2); y <- c(rep(1, ns[1]+ns[2]), rep(-1, ns[3]+ns[4]))
+  shuffle_idx <- sample(n); list(X = X[shuffle_idx, ], y = y[shuffle_idx])
+}
+flip_labels_asym <- function(y, rate_pos = 0, rate_neg = 0, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  idx_p <- which(y==1); kp <- floor(length(idx_p)*rate_pos)
+  idx_n <- which(y==-1); kn <- floor(length(idx_n)*rate_neg)
+  flip_idx <- c(if(kp>0) sample(idx_p,kp) else integer(0), if(kn>0) sample(idx_n,kn) else integer(0))
+  y2 <- y; if(length(flip_idx)) y2[flip_idx] <- -y2[flip_idx]; list(y=y2, flipped_idx=flip_idx)
+}
+pred_e1071_tuned <- function(Xtr, ytr, Xte, kernel = "radial", seed = NULL) {
+  y_fac <- factor(ifelse(ytr > 0, "pos", "neg"))
+
+  if (kernel != "radial") { # Fallback for linear kernel
+    fit <- e1071::svm(x = Xtr, y = y_fac, kernel = "linear", type = "C-classification", cost = 1.0, scale = FALSE)
+  } else {
+    # Define hyperparameter grids consistent with loss_shifting
+    # sigma -> gamma conversion: gamma = 1 / (2 * sigma^2)
+    sigma_grid <- .sigma_grid_from_median_scaled(Xtr, sigma_mult = c(0.5, 1, 2), seed = seed)
+    gamma_grid <- 1 / (2 * sigma_grid^2)
+    cost_grid <- 2^seq(-2, 5, len = 6)
+
+    # Use tune() to perform 3-fold CV
+    if (!is.null(seed)) set.seed(seed)
+    tuned <- e1071::tune(
+      svm,
+      train.x = Xtr, train.y = y_fac,
+      kernel = "radial", type = "C-classification", scale = FALSE,
+      ranges = list(gamma = gamma_grid, cost = cost_grid),
+      tunecontrol = tune.control(cross = 3)
+    )
+    
+    # Train final model with best parameters
+    fit <- tuned$best.model
+  }
+
+  pr <- predict(fit, Xte)
+  ifelse(pr == "pos", 1, -1)
+}
+
+pred_glm_kernel <- function(Xtr, ytr, Xte, seed = NULL) {
+  
+  # Standardize data using helpers from the main script
+  st <- .standardize_fit(Xtr)
+  Xtr_s <- st$Xs
+  Xte_s <- .standardize_apply(Xte, st$mu, st$sd)
+
+  # Generate sigma grid using the same heuristic
+  sigma_grid <- .sigma_grid_from_median_scaled(Xtr, sigma_mult = c(0.5, 1, 2), seed = seed)
+  cv_accs <- numeric(length(sigma_grid))
+  
+  # Manual 3-fold CV to find the best sigma
+  folds <- cv_split(nrow(Xtr), n_folds = 3, strat_y = ytr, seed = seed)
+  
+  for (i in seq_along(sigma_grid)) {
+    s <- sigma_grid[i]
+    fold_accs <- numeric(length(folds))
+    
+    for (k in seq_along(folds)) {
+      # Split data for this fold
+      tr_idx <- folds[[k]]$tr
+      va_idx <- folds[[k]]$va
+      X_cv_tr <- Xtr_s[tr_idx, ]; y_cv_tr <- ytr[tr_idx]
+      X_cv_va <- Xtr_s[va_idx, ]; y_cv_va <- ytr[va_idx]
+      
+      # Kernel feature transformation for training subset
+      K_cv_tr <- rbf_kernel(X_cv_tr, NULL, sigma = s)
+      eig <- eigen(K_cv_tr, symmetric = TRUE)
+      U <- eig$vectors
+      D_inv_sqrt <- 1 / sqrt(pmax(eig$values, .Machine$double.eps))
+      X_feat_tr <- U %*% diag(sqrt(pmax(eig$values, .Machine$double.eps)))
+      
+      # Train GLM on transformed features
+      y_01 <- ifelse(y_cv_tr > 0, 1, 0)
+      train_df <- as.data.frame(cbind(y = y_01, X_feat_tr))
+      fit <- glm(y ~ ., data = train_df, family = binomial(link = "logit"))
+      
+      # Kernel feature transformation for validation subset
+      K_cv_va <- rbf_kernel(X_cv_va, X_cv_tr, sigma = s)
+      Z_feat_va <- K_cv_va %*% U %*% diag(D_inv_sqrt)
+      
+      # Predict and calculate accuracy
+      test_df <- as.data.frame(Z_feat_va)
+      colnames(test_df) <- colnames(train_df)[-1]
+      probs <- predict(fit, test_df, type = "response")
+      preds <- ifelse(probs > 0.5, 1, -1)
+      fold_accs[k] <- mean(preds == y_cv_va)
+    }
+    cv_accs[i] <- mean(fold_accs)
+  }
+  
+  # Select best sigma and train final model on full data
+  best_sigma <- sigma_grid[which.max(cv_accs)]
+  
+  # Final model training on full Xtr
+  K_full_tr <- rbf_kernel(Xtr_s, NULL, sigma = best_sigma)
+  eig_full <- eigen(K_full_tr, symmetric = TRUE)
+  U_full <- eig_full$vectors
+  D_inv_sqrt_full <- 1 / sqrt(pmax(eig_full$values, .Machine$double.eps))
+  X_feat_full_tr <- U_full %*% diag(sqrt(pmax(eig_full$values, .Machine$double.eps)))
+  
+  y_01_full <- ifelse(ytr > 0, 1, 0)
+  train_df_full <- as.data.frame(cbind(y = y_01_full, X_feat_full_tr))
+  fit_final <- glm(y ~ ., data = train_df_full, family = binomial(link = "logit"))
+  
+  # Final prediction on Xte
+  K_te <- rbf_kernel(Xte_s, Xtr_s, sigma = best_sigma)
+  Z_feat_te <- K_te %*% U_full %*% diag(D_inv_sqrt_full)
+  test_df_final <- as.data.frame(Z_feat_te)
+  colnames(test_df_final) <- colnames(train_df_full)[-1]
+  
+  probs_final <- predict(fit_final, test_df_final, type = "response")
+  ifelse(probs_final > 0.5, 1, -1)
+}
+
+run_single_model <- function(model_name, Xtr, ytr, Xte, kernel) {
+  switch(model_name,
+    "e1071" = pred_e1071_tuned(Xtr, ytr, Xte, kernel = kernel), # Call tuned e1071
+    "glm"   = pred_glm_kernel(Xtr, ytr, Xte),               # Call kernelized glm
+    {
+      parts <- strsplit(model_name, "_")[[1]]
+      res <- train_loss_shift(
+        X_train = Xtr, y_train = ytr, X_test = Xte,
+        base_loss = parts[1], style = parts[2], kernel = "gaussian",
+        restarts = 10, n_folds = 3, svm_dual = TRUE, max_iter = 100,
+        line_search = TRUE, verbose = FALSE
+      )
+      res$test_pred
+    }
+  )
+}
+
+## ───────────────────────────────────────────────────────────────────
+## 5) 시뮬레이션 핵심 함수 (완전 병렬 방식)
+## ───────────────────────────────────────────────────────────────────
+run_grid_fully_parallel <- function(n_train, n_test, rates_pos, rates_neg,
+                                    data_gen_fun, oracle_fun, kernel = "linear",
+                                    k = 20, seed = 2025, digits = 5) {
+  p <- 2
+  plan(multisession)
+
+  # 1. 실행할 모든 작업의 조합을 하나의 그리드로 생성
+  task_grid <- expand.grid(
+    rate_pos = rates_pos,
+    rate_neg = rates_neg,
+    rep_i = 1:k,
+    stringsAsFactors = FALSE
+  )
+  
+  cat(sprintf("\n--- Running a total of %d independent simulations in parallel ---\n", nrow(task_grid)))
+  
+  # 2. 전체 작업 그리드를 병렬로 실행
+  with_progress({
+    p_bar <- progressor(steps = nrow(task_grid))
+    
+    results_list <- future_lapply(1:nrow(task_grid), function(j) {
+      current_rate_pos <- task_grid$rate_pos[j]
+      current_rate_neg <- task_grid$rate_neg[j]
+      
+      current_seed <- seed + j # 각 작업에 고유 시드 부여
+      Tr <- data_gen_fun(n_train, seed = current_seed + 1)
+      Te <- data_gen_fun(n_test,  seed = current_seed + 2)
+      
+      ytr_noisy <- flip_labels_asym(
+        Tr$y, rate_pos = current_rate_pos, rate_neg = current_rate_neg,
+        seed = current_seed + 3
+      )$y
+      
+      accuracies <- sapply(MODEL_COLS, function(model_name) {
+        y_pred <- run_single_model(model_name, Tr$X, ytr_noisy, Te$X, kernel)
+        acc(Te$y, y_pred)
+      })
+      
+      true_acc <- acc(Te$y, oracle_fun(Te$X))
+      
+      p_bar(sprintf("rp=%.2f", current_rate_pos))
+      
+      # 결과와 함께 식별자(rate_pos) 반환
+      c(rate_pos = current_rate_pos, rate_neg = current_rate_neg, accuracies, true = true_acc)
+      
+    }, future.seed = TRUE)
+  })
+
+  # 3. 모든 병렬 작업이 끝난 후 결과를 한번에 집계
+  cat("\n--- All simulations complete. Aggregating results. ---\n")
+  
+  full_results_df <- bind_rows(lapply(results_list, as.list))
+  
+  agg_results <- full_results_df %>%
+    group_by(rate_pos, rate_neg) %>%
+    summarise(across(all_of(c(MODEL_COLS, "true")), list(mean = mean, sd = sd)), .groups = 'drop')
+
+  # 4. 결과 포맷팅
+  formatted_df <- data.frame(n = n_train, p = p, rate_pos = agg_results$rate_pos, rate_neg = agg_results$rate_neg)
+  all_cols_ordered <- TABLE_COLS[-(1:4)]
+  
+  for (col in all_cols_ordered) {
+    mean_col <- paste0(col, "_mean"); sd_col <- paste0(col, "_sd")
+    sd_vals <- ifelse(is.na(agg_results[[sd_col]]), 0, agg_results[[sd_col]])
+    formatted_df[[col]] <- sprintf("%.*f (%.*f)", digits, agg_results[[mean_col]], digits, sd_vals)
+  }
+  
+  return(formatted_df)
+}
+
+
+## ───────────────────────────────────────────────────────────────────
+## 시뮬레이션 실행
+## ───────────────────────────────────────────────────────────────────
+source("loss_shifting_v4.R")
+oracle_xor <- function(Xte) ifelse(Xte[,1] * Xte[,2] >= 0, 1, -1)
+
+N_VEC <- c(200); RATES_POS <- c(0.00, 0.05, 0.10, 0.15, 0.2); RATES_NEG <- c(0.00)
+N_TEST <- 400; K_REPS <- 10; SEED <- 20250910; DIGITS <- 5
+
+cat("\n--- Running Scenario: XOR Data with RBF Kernel (Fully Parallel Method) ---\n")
+
+tbl_xor_rbf <- run_grid_fully_parallel(
+  n_train       = N_VEC[1], rates_pos     = RATES_POS, rates_neg     = RATES_NEG,
+  n_test        = N_TEST, data_gen_fun  = gen_xor_2d, oracle_fun    = oracle_xor,
+  kernel        = "radial", k             = K_REPS, seed          = SEED, digits        = DIGITS
+)
+
+tbl_xor_rbf$scenario <- "XOR (RBF Kernel)"
+final_results <- tbl_xor_rbf[, c("scenario", setdiff(names(tbl_xor_rbf), "scenario"))]
+write.csv(final_results, "xor_0917.csv", row.names = FALSE)
+print(final_results)
+```
