@@ -88,7 +88,7 @@ pred_e1071_aligned <- function(Xtr, ytr, Xte, kernel = "radial", seed = NULL) {
     
     sigma_grid <- .sigma_grid_from_median_scaled(Xtr, sigma_mult = c(0.5, 1, 2), seed = seed)
     gamma_grid <- 1 / (2 * sigma_grid^2)
-    lambda_grid <- 2^seq(-10, 0, length.out = 6)
+    lambda_grid <- 2^seq(-12, 0, length.out = 6)
     cost_grid <- 1 / (2 * n * lambda_grid + 1e-10) ######################################################################################
 
     tuned <- e1071::tune(
