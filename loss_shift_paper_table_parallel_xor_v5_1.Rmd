@@ -20,7 +20,8 @@ suppressPackageStartupMessages({
   library(future)
   library(future.apply)
   library(progressr)
-  library(glmnet) # [NEW] glmnet 패키지 추가
+  #library(glmnet) # [NEW] glmnet 패키지 추가
+  library(kernlab)
 })
 
 ## ───────────────────────────────────────────────────────────────────
@@ -115,64 +116,74 @@ pred_e1071_aligned <- function(Xtr, ytr, Xte, kernel = "radial", seed = NULL) {
 
 
 # [NEW] 정규화와 효율성을 모두 개선한 새로운 커널 GLM 함수
+# NOTE: 함수 이름은 유지하되, 내부적으로는 kernlab::krr (커널 트릭)을 사용하도록 변경.
+
 pred_glm_kernel_glmnet <- function(Xtr, ytr, Xte, seed = NULL) {
-  # 데이터는 이미 사전 표준화되어 Xtr, Xte로 전달됨
+  # kernlab 패키지 로드 (설치 필요 시 install.packages("kernlab"))
+  if (!requireNamespace("kernlab", quietly = TRUE)) {
+    stop("kernlab 패키지가 필요합니다. install.packages('kernlab')을 실행해주세요.")
+  }
+
+  # --- 1. 최적의 sigma와 lambda를 찾기 위한 Grid Search + CV ---
   
-  # 1. 최적의 sigma를 찾기 위한 CV
+  # 다른 모델들과 동일한 탐색 범위를 사용
   sigma_grid <- .sigma_grid_from_median_scaled(Xtr, sigma_mult = c(0.5, 1, 2), seed = seed)
-  cv_accs <- numeric(length(sigma_grid))
+  # 탐색 범위를 넓혀 모델의 잠재력을 충분히 확인
+  lambda_grid <- 2^seq(-12, 0, length.out = 6) 
+  
+  # 테스트할 모든 하이퍼파라미터 조합 생성
+  cv_params <- expand.grid(sigma = sigma_grid, lambda = lambda_grid)
+  cv_accs <- numeric(nrow(cv_params))
+  
+  # 교차 검증을 위한 데이터 분할
   folds <- cv_split(nrow(Xtr), n_folds = 3, strat_y = ytr, seed = seed)
   
-  for (i in seq_along(sigma_grid)) {
-    s <- sigma_grid[i]
+  # Grid Search 시작
+  for (i in 1:nrow(cv_params)) {
+    s <- cv_params$sigma[i]
+    lam <- cv_params$lambda[i]
     fold_accs <- numeric(length(folds))
-    
+
     for (k in seq_along(folds)) {
-      tr_idx <- folds[[k]]$tr; va_idx <- folds[[k]]$va
-      X_cv_tr <- Xtr[tr_idx, ]; y_cv_tr <- ytr[tr_idx]
-      X_cv_va <- Xtr[va_idx, ]; y_cv_va <- ytr[va_idx]
+      tr_idx <- folds[[k]]$tr
+      va_idx <- folds[[k]]$va
       
-      # 커널 피처 생성 (PCA 방식과 유사)
-      K_cv_tr <- rbf_kernel(X_cv_tr, NULL, sigma = s)
-      eig <- eigen(K_cv_tr, symmetric = TRUE)
-      vals <- pmax(eig$values, .Machine$double.eps)
-      U <- eig$vectors
-      D_inv_sqrt <- 1 / sqrt(vals)
-      X_feat_tr <- U %*% diag(sqrt(vals))
+      X_cv_tr <- Xtr[tr_idx, ]
+      y_cv_tr <- ytr[tr_idx]
+      X_cv_va <- Xtr[va_idx, ]
+      y_cv_va <- ytr[va_idx]
       
-      # cv.glmnet으로 최적 lambda 탐색 및 학습
-      y_fac <- factor(y_cv_tr)
-      fit_glmnet <- cv.glmnet(X_feat_tr, y_fac, family = "binomial", type.measure = "class")
+      # kernlab::krr 함수로 모델 학습 (커널 트릭 사용)
+      # rbfdot: RBF 커널을 의미하며, sigma를 직접 파라미터로 받음
+      fit <- kernlab::krr(x = X_cv_tr, y = y_cv_tr, kernel = rbfdot(sigma = s), lambda = lam)
       
-      # 검증 데이터에 대한 피처 변환 및 예측
-      K_cv_va <- rbf_kernel(X_cv_va, X_cv_tr, sigma = s)
-      Z_feat_va <- K_cv_va %*% U %*% diag(D_inv_sqrt)
-      preds <- predict(fit_glmnet, newx = Z_feat_va, s = "lambda.min", type = "class")
+      # 검증 데이터로 예측
+      preds_raw <- predict(fit, X_cv_va)
+      # krr의 연속형 예측값을 sign() 함수를 이용해 -1, 1 클래스로 변환
+      preds_class <- sign(preds_raw) 
       
-      fold_accs[k] <- mean(as.numeric(as.character(preds)) == y_cv_va)
+      fold_accs[k] <- mean(preds_class == y_cv_va, na.rm = TRUE)
     }
-    cv_accs[i] <- mean(fold_accs)
+    cv_accs[i] <- mean(fold_accs, na.rm = TRUE)
   }
   
-  # 2. 최적 sigma로 전체 학습 데이터에 대한 최종 모델 학습
-  best_sigma <- sigma_grid[which.max(cv_accs)]
+  # --- 2. 최적 파라미터로 전체 학습 데이터에 대한 최종 모델 학습 ---
   
-  K_full_tr <- rbf_kernel(Xtr, NULL, sigma = best_sigma)
-  eig_full <- eigen(K_full_tr, symmetric = TRUE)
-  vals_full <- pmax(eig_full$values, .Machine$double.eps)
-  U_full <- eig_full$vectors
-  D_inv_sqrt_full <- 1 / sqrt(vals_full)
-  X_feat_full_tr <- U_full %*% diag(sqrt(vals_full))
+  best_param_idx <- which.max(cv_accs)
+  # 만약 모든 CV 정확도가 동일할 경우, 더 단순한 모델(lambda가 큰)을 선택
+  if (length(unique(cv_accs)) == 1) best_param_idx <- nrow(cv_params) 
   
-  y_fac_full <- factor(ytr)
-  fit_final <- cv.glmnet(X_feat_full_tr, y_fac_full, family = "binomial", type.measure = "class")
+  best_params <- cv_params[best_param_idx, ]
+  best_sigma <- best_params$sigma
+  best_lambda <- best_params$lambda
   
-  # 3. 테스트 데이터에 대한 최종 예측
-  K_te <- rbf_kernel(Xte, Xtr, sigma = best_sigma)
-  Z_feat_te <- K_te %*% U_full %*% diag(D_inv_sqrt_full)
+  final_fit <- kernlab::krr(x = Xtr, y = ytr, kernel = rbfdot(sigma = best_sigma), lambda = best_lambda)
   
-  preds_final <- predict(fit_final, newx = Z_feat_te, s = "lambda.min", type = "class")
-  ifelse(preds_final == "1", 1, -1)
+  # --- 3. 테스트 데이터에 대한 최종 예측 ---
+  
+  preds_final_raw <- predict(final_fit, Xte)
+  # 최종 예측값도 -1, 1 클래스로 변환하여 반환
+  sign(preds_final_raw)
 }
 
 
