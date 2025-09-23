@@ -10,7 +10,7 @@ suppressPackageStartupMessages({
 # ─────────────────────────────────────────────────────────────
 # 1) 데이터 로드 & "0.947 (0.012)" → mean/sd 파싱
 # ─────────────────────────────────────────────────────────────
-path <- "xor_0917.csv"
+path <- "C:/Users/Tae/Downloads/xor_0918_revised.csv"
 raw  <- readr::read_csv(path, show_col_types = FALSE)
 
 parse_mean <- function(x) readr::parse_number(x)

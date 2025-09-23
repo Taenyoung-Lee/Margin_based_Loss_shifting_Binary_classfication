@@ -88,8 +88,8 @@ pred_e1071_aligned <- function(Xtr, ytr, Xte, kernel = "radial", seed = NULL) {
     
     sigma_grid <- .sigma_grid_from_median_scaled(Xtr, sigma_mult = c(0.5, 1, 2), seed = seed)
     gamma_grid <- 1 / (2 * sigma_grid^2)
-    lambda_grid <- 2^seq(-5, 2, length.out = 6)
-    cost_grid <- 1 / (2 * n * lambda_grid + 1e-10)
+    lambda_grid <- 2^seq(-10, 0, length.out = 6)
+    cost_grid <- 1 / (2 * n * lambda_grid + 1e-10) ######################################################################################
 
     tuned <- e1071::tune(
       svm, train.x = Xtr, train.y = y_fac, kernel = "radial",
@@ -186,7 +186,7 @@ run_single_model <- function(model_name, Xtr_raw, ytr, Xte_raw, Xtr_s, Xte_s, ke
       res <- train_loss_shift(
         X_train = Xtr_raw, y_train = ytr, X_test = Xte_raw,
         base_loss = parts[1], style = parts[2], kernel = "gaussian",
-        restarts = 5, n_folds = 3, svm_dual = TRUE, max_iter = 100,
+        restarts = 10, n_folds = 3, svm_dual = TRUE, max_iter = 100,
         line_search = TRUE, verbose = FALSE
       )
       res$test_pred
