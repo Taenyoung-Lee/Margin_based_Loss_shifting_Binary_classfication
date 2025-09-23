@@ -116,20 +116,54 @@ pred_e1071_aligned <- function(Xtr, ytr, Xte, kernel = "radial", seed = NULL) {
 
 
 pred_glm_kernel_glmnet <- function(Xtr, ytr, Xte, seed = NULL) {
-  # --- (1) 의존성: kernlab -> calibrateBinary 로 교체 ---
-  if (!requireNamespace("calibrateBinary", quietly = TRUE)) {   # CHANGED
-    stop("calibrateBinary 패키지가 필요합니다. install.packages('calibrateBinary')을 실행해주세요.")  # CHANGED
+  # --- 의존성 체크 ---
+  if (!requireNamespace("glmnet", quietly = TRUE)) {
+    stop("glmnet 패키지가 필요합니다. install.packages('glmnet')을 실행해주세요.")
+  }
+  if (!exists(".sigma_grid_from_median_scaled")) {
+    stop(".sigma_grid_from_median_scaled()가 필요합니다 (loss_shifting_v4.R 로드 여부 확인).")
+  }
+  if (!exists("cv_split")) {
+    stop("cv_split()가 필요합니다 (loss_shifting_v4.R 로드 여부 확인).")
+  }
+  # rbf_kernel이 있으면 사용, 없으면 로컬 정의
+  rbfK <- if (exists("rbf_kernel")) {
+    function(A, B = NULL, sigma) rbf_kernel(A, B, sigma)
+  } else {
+    function(A, B = NULL, sigma) {
+      if (is.null(B)) B <- A
+      A <- as.matrix(A); B <- as.matrix(B)
+      D2 <- outer(rowSums(A^2), rowSums(B^2), "+") - 2 * tcrossprod(A, B)
+      exp(-D2 / (2 * sigma^2))
+    }
   }
 
-  # --- 1. 최적의 sigma와 lambda를 찾기 위한 Grid Search + CV (그대로) ---
-  sigma_grid <- .sigma_grid_from_median_scaled(Xtr, sigma_mult = c(0.5, 1, 2), seed = seed)
-  lambda_grid <- 2^seq(-12, 0, length.out = 6)
-  cv_params <- expand.grid(sigma = sigma_grid, lambda = lambda_grid)
-  cv_accs <- numeric(nrow(cv_params))
-  folds <- cv_split(nrow(Xtr), n_folds = 3, strat_y = ytr, seed = seed)
+  if (!is.null(seed)) set.seed(seed)
 
-  # Grid Search
-  for (i in 1:nrow(cv_params)) {
+  # --- 1) σ–λ 그리드 & CV 폴드 설정 (기존과 동일) ---
+  sigma_grid  <- .sigma_grid_from_median_scaled(Xtr, sigma_mult = c(0.5, 1, 2), seed = seed)
+  lambda_grid <- 2^seq(-12, 0, length.out = 6)
+  cv_params   <- expand.grid(sigma = sigma_grid, lambda = lambda_grid, KEEP.OUT.ATTRS = FALSE)
+  folds       <- cv_split(nrow(Xtr), n_folds = 3, strat_y = ytr, seed = seed)
+
+  # 내부 유틸: 고유분해 기반 특성화 Z 구성
+  # - 훈련:  K_tr = U diag(val) U^T  -> Z_tr   = U diag(sqrt(val))
+  # - 검증/테스트: Z_new = K_new U diag(1/sqrt(val))
+  make_Z_train <- function(K_tr) {
+    ee  <- eigen(K_tr, symmetric = TRUE)
+    val <- pmax(ee$values, .Machine$double.eps)
+    U   <- ee$vectors
+    Z_tr <- sweep(U, 2, sqrt(val), `*`)           # U * sqrt(val)
+    U_div <- sweep(U, 2, sqrt(val), `/`)          # U / sqrt(val)  (= U %*% diag(1/sqrt(val)))
+    list(Z_tr = Z_tr, U_div = U_div, val = val)   # val은 진단용
+  }
+  make_Z_new <- function(K_new, U_div) {
+    K_new %*% U_div
+  }
+
+  # --- 2) CV 루프: 각 (σ, λ)에 대해 3-fold 정확도 평균 ---
+  cv_accs <- numeric(nrow(cv_params))
+  for (i in seq_len(nrow(cv_params))) {
     s   <- cv_params$sigma[i]
     lam <- cv_params$lambda[i]
     fold_accs <- numeric(length(folds))
@@ -138,52 +172,72 @@ pred_glm_kernel_glmnet <- function(Xtr, ytr, Xte, seed = NULL) {
       tr_idx <- folds[[k]]$tr
       va_idx <- folds[[k]]$va
 
-      X_cv_tr <- Xtr[tr_idx, , drop = FALSE]
-      y_cv_tr <- ytr[tr_idx]
-      X_cv_va <- Xtr[va_idx, , drop = FALSE]
-      y_cv_va <- ytr[va_idx]
+      X_tr <- Xtr[tr_idx, , drop = FALSE]
+      y_tr <- ytr[tr_idx]
+      X_va <- Xtr[va_idx, , drop = FALSE]
+      y_va <- ytr[va_idx]
 
-      # --- (2) 모델 학습/예측: krr -> KLR 로 교체 ---
-      # KLR은 y가 0/1이어야 하므로 변환(-1/1 -> 0/1)
-      y_cv_tr_01 <- ifelse(y_cv_tr == 1, 1L, 0L)                                   # CHANGED
+      # 2-1) 훈련 커널 고유분해 → Z_tr
+      K_tr  <- rbfK(X_tr, sigma = s)
+      Zinfo <- make_Z_train(K_tr)
+      Z_tr  <- Zinfo$Z_tr
+      U_div <- Zinfo$U_div
 
-      # power-exponential(kernel="exponential") with power=2  => RBF 동형
-      # RBF exp(-||x-x'||^2/(2*sigma^2)) 와 맞추기 위해 rho = 2*sigma^2 사용
-      rho <- 2 * s^2                                                                # CHANGED
-
-      # fold 검증 포인트의 "확률" 직접 계산(훈련+예측을 한 번에)
-      p_va <- calibrateBinary::KLR(                                                 # CHANGED
-        X = X_cv_tr, y = y_cv_tr_01, xnew = X_cv_va,
-        lambda = lam, kernel = "exponential", power = 2, rho = rho
+      # 2-2) glmnet(binomial, ridge) 적합 (intercept는 기본 비규제)
+      y_tr_01 <- ifelse(y_tr == 1, 1L, 0L)
+      fit <- glmnet::glmnet(
+        x = Z_tr, y = y_tr_01,
+        family = "binomial",
+        alpha = 0,                 # ridge
+        lambda = lam,              # 고정 λ (glmnet은 벡터여도 ok)
+        intercept = TRUE,
+        standardize = FALSE
       )
 
-      # 확률 -> 예측 클래스(-1/1로 복원)
-      preds_class <- ifelse(p_va >= 0.5, 1L, -1L)                                   # CHANGED
+      # 2-3) 검증 Z_va 구성 & 예측
+      K_va_tr <- rbfK(X_va, X_tr, sigma = s)
+      Z_va    <- make_Z_new(K_va_tr, U_div)
+      p_va    <- as.numeric(glmnet::predict.glmnet(fit, newx = Z_va, type = "response", s = lam))
+      y_hat   <- ifelse(p_va >= 0.5, 1L, -1L)
 
-      fold_accs[k] <- mean(preds_class == y_cv_va, na.rm = TRUE)
+      fold_accs[k] <- mean(y_hat == y_va)
     }
-    cv_accs[i] <- mean(fold_accs, na.rm = TRUE)
+    cv_accs[i] <- mean(fold_accs)
   }
 
-  # --- 2. 최적 파라미터 선택 (그대로) ---
-  best_param_idx <- which.max(cv_accs)
-  if (length(unique(cv_accs)) == 1) best_param_idx <- nrow(cv_params)
-  best_params  <- cv_params[best_param_idx, ]
-  best_sigma   <- best_params$sigma
-  best_lambda  <- best_params$lambda
+  # --- 3) 최적 파라미터 선택 (동률 시 큰 lambda, 큰 sigma 우선) ---
+  best_idx <- which(cv_accs == max(cv_accs))
+  if (length(best_idx) > 1) {
+    G <- cv_params[best_idx, , drop = FALSE]
+    o <- order(-G$lambda, -G$sigma)  # 큰 λ ▶ 큰 σ
+    best_idx <- best_idx[o[1]]
+  }
+  best_sigma  <- cv_params$sigma[best_idx]
+  best_lambda <- cv_params$lambda[best_idx]
 
-  # --- 3. 최종 학습 & 테스트 예측: krr -> KLR 로 교체 ---
-  ytr_01 <- ifelse(ytr == 1, 1L, 0L)                                               # CHANGED
-  best_rho <- 2 * best_sigma^2                                                     # CHANGED
+  # --- 4) 전체 훈련데이터로 최종 적합 ---
+  K_full  <- rbfK(Xtr, sigma = best_sigma)
+  ZinfoF  <- make_Z_train(K_full)
+  Z_full  <- ZinfoF$Z_tr
+  U_div_F <- ZinfoF$U_div
 
-  p_te <- calibrateBinary::KLR(                                                    # CHANGED
-    X = Xtr, y = ytr_01, xnew = Xte,
-    lambda = best_lambda, kernel = "exponential", power = 2, rho = best_rho
+  ytr_01 <- ifelse(ytr == 1, 1L, 0L)
+  fitF <- glmnet::glmnet(
+    x = Z_full, y = ytr_01,
+    family = "binomial",
+    alpha = 0,
+    lambda = best_lambda,
+    intercept = TRUE,
+    standardize = FALSE
   )
 
-  # 최종 클래스(-1/1) 반환
-  ifelse(p_te >= 0.5, 1L, -1L)                                                     # CHANGED
+  # --- 5) 테스트 예측 ---
+  K_te_tr <- rbfK(Xte, Xtr, sigma = best_sigma)
+  Z_te    <- make_Z_new(K_te_tr, U_div_F)
+  p_te    <- as.numeric(glmnet::predict.glmnet(fitF, newx = Z_te, type = "response", s = best_lambda))
+  ifelse(p_te >= 0.5, 1L, -1L)
 }
+
 
 
 
