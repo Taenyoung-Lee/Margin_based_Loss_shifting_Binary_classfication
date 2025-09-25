@@ -89,7 +89,7 @@ pred_e1071_aligned <- function(Xtr, ytr, Xte, kernel = "radial", seed = NULL) {
     
     sigma_grid <- .sigma_grid_from_median_scaled(Xtr, sigma_mult = c(0.5, 1, 2), seed = seed)
     gamma_grid <- 1 / (2 * sigma_grid^2)
-    lambda_grid <- 2^seq(-12, 0, length.out = 6)
+    lambda_grid <- 10^seq(-12, -2, length.out = 4)
     cost_grid <- 1 / (2 * n * lambda_grid + 1e-10) ######################################################################################
 
     tuned <- e1071::tune(
@@ -142,7 +142,7 @@ pred_glm_kernel_glmnet <- function(Xtr, ytr, Xte, seed = NULL) {
 
   # --- 1) σ–λ 그리드 & CV 폴드 설정 (기존과 동일) ---
   sigma_grid  <- .sigma_grid_from_median_scaled(Xtr, sigma_mult = c(0.5, 1, 2), seed = seed)
-  lambda_grid <- 2^seq(-12, 0, length.out = 6)
+  lambda_grid <- 10^seq(-12, -2, length.out = 4)
   cv_params   <- expand.grid(sigma = sigma_grid, lambda = lambda_grid, KEEP.OUT.ATTRS = FALSE)
   folds       <- cv_split(nrow(Xtr), n_folds = 3, strat_y = ytr, seed = seed)
 
@@ -350,7 +350,7 @@ source("loss_shifting_v4.R") # loss_shifting_v4.R 파일은 수정할 필요 없
 oracle_xor <- function(Xte) ifelse(Xte[,1] * Xte[,2] >= 0, 1, -1)
 
 N_VEC <- c(200); RATES_POS <- c(0.00, 0.05, 0.10, 0.15, 0.2); RATES_NEG <- c(0.00)
-N_TEST <- 400; K_REPS <- 10; SEED <- 20250910; DIGITS <- 5
+N_TEST <- 400; K_REPS <- 10; SEED <- 25; DIGITS <- 5
 
 cat("\n--- Running Scenario: XOR Data with RBF Kernel (Revised & Fairer Method) ---\n")
 
@@ -362,7 +362,7 @@ tbl_xor_rbf <- run_grid_fully_parallel(
 
 tbl_xor_rbf$scenario <- "XOR (RBF Kernel)"
 final_results <- tbl_xor_rbf[, c("scenario", setdiff(names(tbl_xor_rbf), "scenario"))]
-write.csv(final_results, "xor_0918_revised.csv", row.names = FALSE)
+write.csv(final_results, "xorffinal.csv", row.names = FALSE)
 print(final_results)
 
 ```
