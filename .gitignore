@@ -6,3 +6,7 @@
 .html
 
 private/*.R
+# =========================
+# OS / System-specific files
+# =========================
+Zone.Identifier
