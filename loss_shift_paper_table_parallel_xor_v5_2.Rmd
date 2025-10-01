@@ -20,7 +20,7 @@ suppressPackageStartupMessages({
   library(future)
   library(future.apply)
   library(progressr)
-  #library(glmnet) # [NEW] glmnet 패키지 추가
+  library(glmnet) # [NEW] glmnet 패키지 추가
   library(kernlab)
 })
 
