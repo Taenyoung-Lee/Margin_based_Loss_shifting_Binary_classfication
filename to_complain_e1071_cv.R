@@ -44,7 +44,7 @@ make_grid <- function(X, n = 300, pad = 0.8) {
 }
 
 ## XOR data generator (p=2)
-gen_xor_2d <- function(n, p = 2, mu = 1, sd = 0.75, seed = NULL) {
+gen_xor_2d <- function(n, p = 2, mu = 1, sd = 0.5, seed = NULL) {
   stopifnot(p == 2)
   if (!is.null(seed)) set.seed(seed)
   n_per_quad <- n %/% 4; n_rem <- n %% 4
@@ -96,10 +96,15 @@ fit_e1071_aligned <- function(Xtr, ytr, kernel = "radial", seed = NULL, cross = 
   
   n <- nrow(Xtr)
   if (!is.null(seed)) set.seed(seed)
+  ##################################################################################################여기다여기
+  ##################################################################################################여기다여기
+  ##################################################################################################여기다여기
+  ##################################################################################################여기다여기
+  ##################################################################################################여기다여기
   
   sigma_grid  <- .sigma_grid_from_median_scaled(Xtr, sigma_mult = c(0.5, 1, 2), seed = seed)
   gamma_grid  <- 1 / (2 * sigma_grid^2)
-  lambda_grid <- 10^seq(-12, -2, length.out = 4)
+  lambda_grid <- 10^seq(-12, -4, length.out = 4)
   cost_grid   <- 1 / (2 * n * lambda_grid + 1e-10)
   
   tuned <- e1071::tune(
@@ -170,7 +175,7 @@ plot_e1071_boundary_once <- function(n_train, n_test, rate_pos, rate_neg = 0.0,
   
   if (save_png) {
     if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
-    fn <- file.path(out_dir, sprintf("e1071_boundary_ratepos_%0.2f.png", rate_pos))
+    fn <- file.path(out_dir, sprintf("e1071_cv_boundary_ratepos_%0.2f.png", rate_pos))
     ggsave(filename = fn, plot = p, width = 6.8, height = 5.4, dpi = 150)
     message("Saved: ", fn)
   }
