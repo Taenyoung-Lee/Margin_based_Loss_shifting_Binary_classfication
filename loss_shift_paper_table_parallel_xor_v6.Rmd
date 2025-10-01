@@ -12,7 +12,7 @@ output: html_document
 ## 의존성 패키지 로드
 ## ───────────────────────────────────────────────────────────────────
 suppressPackageStartupMessages({
-  library(e1071)
+  # library(e1071)  # [CHANGED] 더 이상 사용하지 않음
   library(tidyr)
   library(dplyr)
   library(knitr)
@@ -20,8 +20,8 @@ suppressPackageStartupMessages({
   library(future)
   library(future.apply)
   library(progressr)
-  library(glmnet) # [NEW] glmnet 패키지 추가
-  library(kernlab)
+  library(glmnet)
+  library(kernlab)  # [CHANGED] ksvm 사용
 })
 
 ## ───────────────────────────────────────────────────────────────────
@@ -32,7 +32,7 @@ TABLE_COLS <- c(
   "hinge_none","sqhinge_none","logistic_none","exp_none",
   "hinge_soft","sqhinge_soft","logistic_soft","exp_soft",
   "hinge_hard","sqhinge_hard","logistic_hard","exp_hard",
-  "e1071", "glm"
+  "ksvm", "glm"  # [CHANGED] e1071 → ksvm
 )
 MODEL_COLS <- setdiff(TABLE_COLS, c("n","p","rate_pos","rate_neg","true"))
 acc <- function(y_true, y_pred) mean(y_true == y_pred)
@@ -64,8 +64,7 @@ flip_labels_asym <- function(y, rate_pos = 0, rate_neg = 0, seed = NULL) {
   y2 <- y; if(length(flip_idx)) y2[flip_idx] <- -y2[flip_idx]; list(y=y2, flipped_idx=flip_idx)
 }
 
-# [MODIFIED] 이제 이 함수들은 사전 표준화된 데이터를 입력받습니다.
-# loss_shifting_v4.R의 helper 함수들을 여기에 복사하여 사용합니다.
+# [MODIFIED] 표준화 유틸 (입출력 동일)
 .standardize_fit <- function(X) {
   mu <- colMeans(X)
   sd <- apply(X, 2, sd); sd[sd == 0] <- 1
@@ -77,56 +76,109 @@ flip_labels_asym <- function(y, rate_pos = 0, rate_neg = 0, seed = NULL) {
   sweep(sweep(X, 2, mu, "-"), 2, sd, "/")
 }
 
-# e1071 SVM 예측 함수 (기존과 거의 동일, scale=FALSE 유지)
-pred_e1071_aligned <- function(Xtr, ytr, Xte, kernel = "radial", seed = NULL) {
-  y_fac <- factor(ifelse(ytr > 0, "pos", "neg"))
+## ───────────────────────────────────────────────────────────────────
+## [CHANGED] e1071 대체: kernlab::ksvm 기반 예측기
+## ───────────────────────────────────────────────────────────────────
+# - kernel = "radial" 이면 rbfdot( gamma = 1/(2*sigma^2) ) 사용
+# - kernel = "linear" 이면 vanilladot 사용
+# - 3-fold CV로 (sigma, C) 그리드 탐색 (동률: 큰 C, 큰 sigma 우선)
+pred_ksvm_aligned <- function(Xtr, ytr, Xte, kernel = "radial", seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  n <- nrow(Xtr)
+  y_fac <- factor(ifelse(ytr > 0, "pos", "neg"), levels = c("neg","pos"))
 
-  if (kernel != "radial") {
-    fit <- e1071::svm(x = Xtr, y = y_fac, kernel = "linear", type = "C-classification", cost = 1.0, scale = FALSE)
-  } else {
-    n <- nrow(Xtr)
-    if (!is.null(seed)) set.seed(seed)
-    
+  # 공통 그리드
+  if (kernel == "radial") {
+    if (!exists(".sigma_grid_from_median_scaled")) {
+      stop(".sigma_grid_from_median_scaled()가 필요합니다 (loss_shifting_v5.R 로드 여부 확인).")
+    }
     sigma_grid <- .sigma_grid_from_median_scaled(Xtr, sigma_mult = c(0.5, 1, 2), seed = seed)
-    gamma_grid <- 1 / (2 * sigma_grid^2)
-    lambda_grid <- 10^seq(-12, -2, length.out = 4)
-    cost_grid <- 1 / (2 * n * lambda_grid + 1e-10) ######################################################################################
-
-    tuned <- e1071::tune(
-      svm, train.x = Xtr, train.y = y_fac, kernel = "radial",
-      type = "C-classification", scale = FALSE,
-      ranges = list(gamma = gamma_grid, cost = cost_grid),
-      tunecontrol = tune.control(cross = 3)
-    )
-    
-    perf_df <- tuned$performances
-    best_error <- min(perf_df$error, na.rm = TRUE)
-    ties <- perf_df[perf_df$error == best_error, ]
-    sorted_ties <- ties[order(ties$cost, ties$gamma), ]
-    best_params <- sorted_ties[1, ]
-
-    fit <- e1071::svm(
-      x = Xtr, y = y_fac, kernel = "radial", type = "C-classification",
-      cost = best_params$cost, gamma = best_params$gamma, scale = FALSE
-    )
+  } else {
+    sigma_grid <- NA_real_
   }
-  pr <- predict(fit, Xte)
-  ifelse(pr == "pos", 1, -1)
+  lambda_grid <- 10^seq(-6, -3, length.out = 4)
+  C_grid <- 1 / ( n * lambda_grid)
+
+  # CV 폴드
+  if (!exists("cv_split")) stop("cv_split()가 필요합니다 (loss_shifting_v5.R).")
+  folds <- cv_split(n, n_folds = 3, strat_y = ytr, seed = seed)
+
+  if (kernel == "radial") {
+    grid <- expand.grid(sigma = sigma_grid, C = C_grid, KEEP.OUT.ATTRS = FALSE)
+  } else {
+    grid <- data.frame(sigma = NA_real_, C = C_grid)
+  }
+
+  cv_accs <- numeric(nrow(grid))
+  for (i in seq_len(nrow(grid))) {
+    Cval <- grid$C[i]
+    if (kernel == "radial") {
+      s     <- grid$sigma[i]
+      gamma <- 1 / (2 * s^2)
+      kobj  <- rbfdot(gamma = gamma)
+    } else {
+      kobj  <- vanilladot()
+    }
+
+    fold_acc <- numeric(length(folds))
+    for (k in seq_along(folds)) {
+      tr_idx <- folds[[k]]$tr
+      va_idx <- folds[[k]]$va
+
+      fit <- kernlab::ksvm(
+        x = Xtr[tr_idx, , drop = FALSE],
+        y = y_fac[tr_idx],
+        type = "C-svc",
+        kernel = kobj,
+        C = Cval,
+        scaled = FALSE
+      )
+      pr_va <- predict(fit, Xtr[va_idx, , drop = FALSE])
+      y_hat <- ifelse(pr_va == "pos", 1L, -1L)
+      fold_acc[k] <- mean(y_hat == ifelse(ytr[va_idx] > 0, 1L, -1L))
+    }
+    cv_accs[i] <- mean(fold_acc)
+  }
+
+  # tie-break: 큰 C, 큰 sigma
+  best_idx <- which(cv_accs == max(cv_accs))
+  if (length(best_idx) > 1) {
+    G <- grid[best_idx, , drop = FALSE]
+    if (kernel == "radial") o <- order(-G$C, -G$sigma) else o <- order(-G$C)
+    best_idx <- best_idx[o[1]]
+  }
+
+  best_C <- grid$C[best_idx]
+  if (kernel == "radial") {
+    best_sigma <- grid$sigma[best_idx]
+    best_gamma <- 1 / (2 * best_sigma^2)
+    best_kobj  <- rbfdot(gamma = best_gamma)
+  } else {
+    best_kobj  <- vanilladot()
+  }
+
+  fitF <- kernlab::ksvm(
+    x = Xtr, y = y_fac,
+    type = "C-svc",
+    kernel = best_kobj,
+    C = best_C,
+    scaled = FALSE
+  )
+  pr_te <- predict(fitF, Xte)
+  ifelse(pr_te == "pos", 1L, -1L)
 }
 
-
+## ───────────────────────────────────────────────────────────────────
+## (그대로 유지) GLM 경로: 커널-GLM with glmnet
+## ───────────────────────────────────────────────────────────────────
 pred_glm_kernel_glmnet <- function(Xtr, ytr, Xte, seed = NULL) {
-  # --- 의존성 체크 ---
-  if (!requireNamespace("glmnet", quietly = TRUE)) {
-    stop("glmnet 패키지가 필요합니다. install.packages('glmnet')을 실행해주세요.")
-  }
-  if (!exists(".sigma_grid_from_median_scaled")) {
-    stop(".sigma_grid_from_median_scaled()가 필요합니다 (loss_shifting_v4.R 로드 여부 확인).")
-  }
-  if (!exists("cv_split")) {
-    stop("cv_split()가 필요합니다 (loss_shifting_v4.R 로드 여부 확인).")
-  }
-  # rbf_kernel이 있으면 사용, 없으면 로컬 정의
+  if (!requireNamespace("glmnet", quietly = TRUE))
+    stop("glmnet 패키지가 필요합니다. install.packages('glmnet')")
+  if (!exists(".sigma_grid_from_median_scaled"))
+    stop(".sigma_grid_from_median_scaled()가 필요합니다 (loss_shifting_v5.R).")
+  if (!exists("cv_split"))
+    stop("cv_split()가 필요합니다 (loss_shifting_v5.R).")
+
   rbfK <- if (exists("rbf_kernel")) {
     function(A, B = NULL, sigma) rbf_kernel(A, B, sigma)
   } else {
@@ -140,28 +192,21 @@ pred_glm_kernel_glmnet <- function(Xtr, ytr, Xte, seed = NULL) {
 
   if (!is.null(seed)) set.seed(seed)
 
-  # --- 1) σ–λ 그리드 & CV 폴드 설정 (기존과 동일) ---
   sigma_grid  <- .sigma_grid_from_median_scaled(Xtr, sigma_mult = c(0.5, 1, 2), seed = seed)
-  lambda_grid <- 10^seq(-12, -2, length.out = 4)
+  lambda_grid <- 10^seq(-6, -3, length.out = 4)
   cv_params   <- expand.grid(sigma = sigma_grid, lambda = lambda_grid, KEEP.OUT.ATTRS = FALSE)
   folds       <- cv_split(nrow(Xtr), n_folds = 3, strat_y = ytr, seed = seed)
 
-  # 내부 유틸: 고유분해 기반 특성화 Z 구성
-  # - 훈련:  K_tr = U diag(val) U^T  -> Z_tr   = U diag(sqrt(val))
-  # - 검증/테스트: Z_new = K_new U diag(1/sqrt(val))
   make_Z_train <- function(K_tr) {
     ee  <- eigen(K_tr, symmetric = TRUE)
     val <- pmax(ee$values, .Machine$double.eps)
     U   <- ee$vectors
-    Z_tr <- sweep(U, 2, sqrt(val), `*`)           # U * sqrt(val)
-    U_div <- sweep(U, 2, sqrt(val), `/`)          # U / sqrt(val)  (= U %*% diag(1/sqrt(val)))
-    list(Z_tr = Z_tr, U_div = U_div, val = val)   # val은 진단용
+    Z_tr <- sweep(U, 2, sqrt(val), `*`)
+    U_div <- sweep(U, 2, sqrt(val), `/`)
+    list(Z_tr = Z_tr, U_div = U_div, val = val)
   }
-  make_Z_new <- function(K_new, U_div) {
-    K_new %*% U_div
-  }
+  make_Z_new <- function(K_new, U_div) K_new %*% U_div
 
-  # --- 2) CV 루프: 각 (σ, λ)에 대해 3-fold 정확도 평균 ---
   cv_accs <- numeric(nrow(cv_params))
   for (i in seq_len(nrow(cv_params))) {
     s   <- cv_params$sigma[i]
@@ -177,24 +222,21 @@ pred_glm_kernel_glmnet <- function(Xtr, ytr, Xte, seed = NULL) {
       X_va <- Xtr[va_idx, , drop = FALSE]
       y_va <- ytr[va_idx]
 
-      # 2-1) 훈련 커널 고유분해 → Z_tr
       K_tr  <- rbfK(X_tr, sigma = s)
       Zinfo <- make_Z_train(K_tr)
       Z_tr  <- Zinfo$Z_tr
       U_div <- Zinfo$U_div
 
-      # 2-2) glmnet(binomial, ridge) 적합 (intercept는 기본 비규제)
       y_tr_01 <- ifelse(y_tr == 1, 1L, 0L)
       fit <- glmnet::glmnet(
         x = Z_tr, y = y_tr_01,
         family = "binomial",
-        alpha = 0,                 # ridge
-        lambda = lam,              # 고정 λ (glmnet은 벡터여도 ok)
+        alpha = 0,
+        lambda = lam,
         intercept = TRUE,
         standardize = FALSE
       )
 
-      # 2-3) 검증 Z_va 구성 & 예측
       K_va_tr <- rbfK(X_va, X_tr, sigma = s)
       Z_va    <- make_Z_new(K_va_tr, U_div)
       p_va    <- as.numeric(glmnet::predict.glmnet(fit, newx = Z_va, type = "response", s = lam))
@@ -205,7 +247,6 @@ pred_glm_kernel_glmnet <- function(Xtr, ytr, Xte, seed = NULL) {
     cv_accs[i] <- mean(fold_accs)
   }
 
-  # --- 3) 최적 파라미터 선택 (동률 시 큰 lambda, 큰 sigma 우선) ---
   best_idx <- which(cv_accs == max(cv_accs))
   if (length(best_idx) > 1) {
     G <- cv_params[best_idx, , drop = FALSE]
@@ -215,7 +256,6 @@ pred_glm_kernel_glmnet <- function(Xtr, ytr, Xte, seed = NULL) {
   best_sigma  <- cv_params$sigma[best_idx]
   best_lambda <- cv_params$lambda[best_idx]
 
-  # --- 4) 전체 훈련데이터로 최종 적합 ---
   K_full  <- rbfK(Xtr, sigma = best_sigma)
   ZinfoF  <- make_Z_train(K_full)
   Z_full  <- ZinfoF$Z_tr
@@ -231,39 +271,40 @@ pred_glm_kernel_glmnet <- function(Xtr, ytr, Xte, seed = NULL) {
     standardize = FALSE
   )
 
-  # --- 5) 테스트 예측 ---
   K_te_tr <- rbfK(Xte, Xtr, sigma = best_sigma)
   Z_te    <- make_Z_new(K_te_tr, U_div_F)
   p_te    <- as.numeric(glmnet::predict.glmnet(fitF, newx = Z_te, type = "response", s = best_lambda))
   ifelse(p_te >= 0.5, 1L, -1L)
 }
 
-
-
-
-# [MODIFIED] 모델 실행 함수: 표준화된 데이터를 받고, 새 GLM 함수를 호출
-run_single_model <- function(model_name, Xtr_raw, ytr, Xte_raw, Xtr_s, Xte_s, kernel) {
+## ───────────────────────────────────────────────────────────────────
+## [CHANGED] 모델 실행 함수: loss_shift에 precomp 전달
+## ───────────────────────────────────────────────────────────────────
+run_single_model <- function(model_name, Xtr_raw, ytr, Xte_raw, Xtr_s, Xte_s, kernel,
+                             precomp = NULL, seed = NULL) {
   switch(model_name,
-    "e1071" = pred_e1071_aligned(Xtr_s, ytr, Xte_s, kernel = kernel),
-    "glm"   = pred_glm_kernel_glmnet(Xtr_s, ytr, Xte_s), # [MODIFIED] 새 함수 호출
+    "ksvm" = pred_ksvm_aligned(Xtr_s, ytr, Xte_s,
+                               kernel = ifelse(kernel=="radial","radial","linear"),
+                               seed = seed),
+    "glm"  = pred_glm_kernel_glmnet(Xtr_s, ytr, Xte_s, seed = seed),
     {
       parts <- strsplit(model_name, "_")[[1]]
       res <- train_loss_shift(
         X_train = Xtr_raw, y_train = ytr, X_test = Xte_raw,
         base_loss = parts[1], style = parts[2], kernel = "gaussian",
         restarts = 10, n_folds = 3, svm_dual = TRUE, max_iter = 100,
-        line_search = TRUE, verbose = FALSE
+        line_search = TRUE, verbose = FALSE,
+        precomp = precomp,          # <<< precomp 전달
+        seed = seed
       )
       res$test_pred
     }
   )
 }
 
-
 ## ───────────────────────────────────────────────────────────────────
-## 5) 시뮬레이션 핵심 함수
+## 5) 시뮬레이션 핵심 함수: precomp를 한 번만 생성 후 공유
 ## ───────────────────────────────────────────────────────────────────
-# [MODIFIED] 루프 내에서 데이터 표준화를 직접 수행
 run_grid_fully_parallel <- function(n_train, n_test, rates_pos, rates_neg,
                                     data_gen_fun, oracle_fun, kernel = "linear",
                                     k = 20, seed = 2025, digits = 5) {
@@ -288,13 +329,21 @@ run_grid_fully_parallel <- function(n_train, n_test, rates_pos, rates_neg,
       current_seed <- seed + j
       
       # 데이터 생성
-      Tr <- data_gen_fun(n_train, seed = current_seed + 1)
-      Te <- data_gen_fun(n_test,  seed = current_seed + 2)
+      Tr <- data_gen_fun(n_train, seed = current_seed + 100)
+      Te <- data_gen_fun(n_test,  seed = current_seed + 200)
       
-      # [MODIFIED] 데이터 표준화
+      # 표준화
       st <- .standardize_fit(Tr$X)
       Tr_X_s <- st$Xs
       Te_X_s <- .standardize_apply(Te$X, st$mu, st$sd)
+
+      # (중요) loss_shift용 precomp를 "한 번"만 생성
+      #  - sigma_grid를 NULL로 두면 v5 내부의 median heuristic + sigma_mult 사용
+      precomp <- loss_shift_build_precomp(
+        X = Tr$X, kernel = "gaussian", standardize = TRUE,
+        sigma_grid = NULL, sigma_mult = c(0.5, 1, 2),
+        seed = current_seed + 10
+      )
 
       # 노이즈 추가
       ytr_noisy <- flip_labels_asym(
@@ -302,7 +351,7 @@ run_grid_fully_parallel <- function(n_train, n_test, rates_pos, rates_neg,
         seed = current_seed + 3
       )$y
       
-      # 표준화된 데이터로 모델 학습 및 평가
+      # 모델 학습/평가 (loss_shift 계열은 precomp 공유)
       accuracies <- sapply(MODEL_COLS, function(model_name) {
         y_pred <- run_single_model(
           model_name,
@@ -311,7 +360,9 @@ run_grid_fully_parallel <- function(n_train, n_test, rates_pos, rates_neg,
           Te$X,            # raw test
           Tr_X_s,          # standardized train
           Te_X_s,          # standardized test
-          kernel
+          kernel,
+          precomp = precomp,   # <<< 공유 precomp
+          seed = current_seed + 100
         )
         acc(Te$y, y_pred)
       })
@@ -324,12 +375,12 @@ run_grid_fully_parallel <- function(n_train, n_test, rates_pos, rates_neg,
     }, future.seed = TRUE)
   })
 
-  # 결과 집계 및 포맷팅 (기존과 동일)
+  # 결과 집계 및 포맷팅
   cat("\n--- All simulations complete. Aggregating results. ---\n")
-  full_results_df <- bind_rows(lapply(results_list, as.list))
+  full_results_df <- dplyr::bind_rows(lapply(results_list, as.list))
   agg_results <- full_results_df %>%
-    group_by(rate_pos, rate_neg) %>%
-    summarise(across(all_of(c(MODEL_COLS, "true")), list(mean = mean, sd = sd)), .groups = 'drop')
+    dplyr::group_by(rate_pos, rate_neg) %>%
+    dplyr::summarise(dplyr::across(all_of(c(MODEL_COLS, "true")), list(mean = mean, sd = sd)), .groups = 'drop')
 
   formatted_df <- data.frame(n = n_train, p = p, rate_pos = agg_results$rate_pos, rate_neg = agg_results$rate_neg)
   all_cols_ordered <- TABLE_COLS[-(1:4)]
@@ -346,13 +397,13 @@ run_grid_fully_parallel <- function(n_train, n_test, rates_pos, rates_neg,
 ## ───────────────────────────────────────────────────────────────────
 ## 시뮬레이션 실행
 ## ───────────────────────────────────────────────────────────────────
-source("loss_shifting_v4.R") # loss_shifting_v4.R 파일은 수정할 필요 없습니다.
+source("loss_shifting_v5.R")  # <<< v5를 로드 (precomp 지원 포함)
 oracle_xor <- function(Xte) ifelse(Xte[,1] * Xte[,2] >= 0, 1, -1)
 
 N_VEC <- c(200); RATES_POS <- c(0.00, 0.05, 0.10, 0.15, 0.2); RATES_NEG <- c(0.00)
-N_TEST <- 400; K_REPS <- 10; SEED <- 25; DIGITS <- 5
+N_TEST <- 800; K_REPS <- 3; SEED <- 25; DIGITS <- 5
 
-cat("\n--- Running Scenario: XOR Data with RBF Kernel (Revised & Fairer Method) ---\n")
+cat("\n--- Running Scenario: XOR Data with RBF Kernel (kernlab ksvm + loss_shift precomp) ---\n")
 
 tbl_xor_rbf <- run_grid_fully_parallel(
   n_train       = N_VEC[1], rates_pos     = RATES_POS, rates_neg     = RATES_NEG,
@@ -360,10 +411,11 @@ tbl_xor_rbf <- run_grid_fully_parallel(
   kernel        = "radial", k             = K_REPS, seed          = SEED, digits        = DIGITS
 )
 
-tbl_xor_rbf$scenario <- "XOR (RBF Kernel)"
+tbl_xor_rbf$scenario <- "XOR (RBF Kernel, precomp for loss_shift)"
 final_results <- tbl_xor_rbf[, c("scenario", setdiff(names(tbl_xor_rbf), "scenario"))]
-write.csv(final_results, "xorffinal.csv", row.names = FALSE)
+write.csv(final_results, "xor_precomp_final.csv", row.names = FALSE)
 print(final_results)
+
 
 ```
 
