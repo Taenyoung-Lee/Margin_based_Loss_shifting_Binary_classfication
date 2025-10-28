@@ -1,0 +1,405 @@
+---
+title: "loss_shift_numerical_table"
+author: "Taenyoung Lee"
+date: "2025-10-28"
+output: html_document
+---
+
+```{r}
+# ───────────────────────────────────────────────────────────────────
+# Loss-shifting 실험 (iteration별 즉시 저장 + p∈{2,5,10} + svm_dual=T/F 동시)
+# 데이터 분포: Uniform[-a, a]^p + product-sign 라벨 (0이면 rnorm 기준 ±1)
+# 파일 구성: 이 스크립트 + 동일 폴더의 loss_shifting_v4.R
+# ───────────────────────────────────────────────────────────────────
+
+suppressPackageStartupMessages({
+  library(e1071)
+  library(tidyr)
+  library(dplyr)
+  library(future)
+  library(future.apply)
+  library(progressr)
+  library(glmnet)
+  library(kernlab)
+})
+
+# ───────────────────────────────────────────────────────────────────
+# 0) 공통 유틸
+# ───────────────────────────────────────────────────────────────────
+acc <- function(y_true, y_pred) mean(y_true == y_pred)
+
+# product-sign 라벨링: x1*…*xp >0 → +1, <0 → -1, ==0 → rnorm>=0 → +1, <0 → -1
+oracle_prod_sign <- function(X) {
+  pr <- apply(X, 1, prod)
+  z  <- integer(length(pr))
+  zero_idx <- which(pr == 0)
+  if (length(zero_idx)) {
+    z_r <- rnorm(length(zero_idx))
+    z[zero_idx] <- ifelse(z_r >= 0, 1L, -1L)
+  }
+  nz_idx <- which(pr != 0)
+  if (length(nz_idx)) {
+    z[nz_idx] <- ifelse(pr[nz_idx] > 0, 1L, -1L)
+  }
+  z
+}
+
+# Uniform[-a, a]^p에서 샘플 → product-sign 라벨
+gen_parity_uniform <- function(n, p, a = 1, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  X <- matrix(runif(n * p, min = -a, max = a), n, p)
+  pr <- apply(X, 1, prod)
+  y <- ifelse(
+    pr > 0,  1L,
+    ifelse(pr < 0, -1L,
+           ifelse(rnorm(length(pr)) >= 0, 1L, -1L))
+  )
+  list(X = X, y = y)
+}
+
+# 비대칭 라벨 노이즈
+flip_labels_asym <- function(y, rate_pos = 0, rate_neg = 0, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  idx_p <- which(y == 1); kp <- floor(length(idx_p) * rate_pos)
+  idx_n <- which(y == -1); kn <- floor(length(idx_n) * rate_neg)
+  flip_idx <- c(if (kp > 0) sample(idx_p, kp) else integer(0),
+                if (kn > 0) sample(idx_n, kn) else integer(0))
+  y2 <- y
+  if (length(flip_idx)) y2[flip_idx] <- -y2[flip_idx]
+  list(y = y2, flipped_idx = flip_idx)
+}
+
+# 표준화 유틸
+.standardize_fit <- function(X) {
+  mu <- colMeans(X)
+  sd <- apply(X, 2, sd); sd[sd == 0] <- 1
+  Xs <- sweep(sweep(X, 2, mu, "-"), 2, sd, "/")
+  list(Xs = Xs, mu = mu, sd = sd)
+}
+.standardize_apply <- function(X, mu, sd) {
+  sd[sd == 0] <- 1
+  sweep(sweep(X, 2, mu, "-"), 2, sd, "/")
+}
+
+# ───────────────────────────────────────────────────────────────────
+# 1) 외부 의존 로드 (train_loss_shift, .sigma_grid_from_median_scaled, cv_split, rbf_kernel 등)
+# ───────────────────────────────────────────────────────────────────
+source("loss_shifting_v4.R")
+
+# ───────────────────────────────────────────────────────────────────
+# 2) 베이스라인 모델들
+# ───────────────────────────────────────────────────────────────────
+pred_e1071_aligned <- function(Xtr, ytr, Xte, kernel = "radial", seed = NULL) {
+  y_fac <- factor(ifelse(ytr > 0, "pos", "neg"))
+
+  if (kernel != "radial") {
+    fit <- e1071::svm(x = Xtr, y = y_fac, kernel = "linear",
+                      type = "C-classification", cost = 1.0, scale = FALSE)
+  } else {
+    n <- nrow(Xtr)
+    if (!is.null(seed)) set.seed(seed)
+    sigma_grid <- .sigma_grid_from_median_scaled(Xtr, sigma_mult = c(0.5, 1, 2), seed = seed)
+    gamma_grid <- 1 / (2 * sigma_grid^2)
+    lambda_grid <- 10^seq(-12, -2, length.out = 4)
+    cost_grid <- 1 / (2 * n * lambda_grid + 1e-10)
+
+    tuned <- e1071::tune(
+      svm, train.x = Xtr, train.y = y_fac, kernel = "radial",
+      type = "C-classification", scale = FALSE,
+      ranges = list(gamma = gamma_grid, cost = cost_grid),
+      tunecontrol = tune.control(cross = 3)
+    )
+    perf_df <- tuned$performances
+    best_error <- min(perf_df$error, na.rm = TRUE)
+    ties <- perf_df[perf_df$error == best_error, ]
+    sorted_ties <- ties[order(ties$cost, ties$gamma), ]
+    best_params <- sorted_ties[1, ]
+
+    fit <- e1071::svm(
+      x = Xtr, y = y_fac, kernel = "radial", type = "C-classification",
+      cost = best_params$cost, gamma = best_params$gamma, scale = FALSE
+    )
+  }
+  pr <- predict(fit, Xte)
+  ifelse(pr == "pos", 1L, -1L)
+}
+
+pred_glm_kernel_glmnet <- function(Xtr, ytr, Xte, seed = NULL) {
+  if (!requireNamespace("glmnet", quietly = TRUE)) stop("glmnet 필요")
+  if (!exists(".sigma_grid_from_median_scaled")) stop(".sigma_grid_from_median_scaled() 필요")
+  if (!exists("cv_split")) stop("cv_split() 필요")
+
+  rbfK <- if (exists("rbf_kernel")) {
+    function(A, B = NULL, sigma) rbf_kernel(A, B, sigma)
+  } else {
+    function(A, B = NULL, sigma) {
+      if (is.null(B)) B <- A
+      A <- as.matrix(A); B <- as.matrix(B)
+      D2 <- outer(rowSums(A^2), rowSums(B^2), "+") - 2 * tcrossprod(A, B)
+      exp(-D2 / (2 * sigma^2))
+    }
+  }
+
+  if (!is.null(seed)) set.seed(seed)
+
+  sigma_grid  <- .sigma_grid_from_median_scaled(Xtr, sigma_mult = c(0.5, 1, 2), seed = seed)
+  lambda_grid <- 10^seq(-12, -2, length.out = 4)
+  cv_params   <- expand.grid(sigma = sigma_grid, lambda = lambda_grid, KEEP.OUT.ATTRS = FALSE)
+  folds       <- cv_split(nrow(Xtr), n_folds = 3, strat_y = ytr, seed = seed)
+
+  make_Z_train <- function(K_tr) {
+    ee  <- eigen(K_tr, symmetric = TRUE)
+    val <- pmax(ee$values, .Machine$double.eps)
+    U   <- ee$vectors
+    Z_tr <- sweep(U, 2, sqrt(val), `*`)
+    U_div <- sweep(U, 2, sqrt(val), `/`)
+    list(Z_tr = Z_tr, U_div = U_div, val = val)
+  }
+  make_Z_new <- function(K_new, U_div) K_new %*% U_div
+
+  cv_accs <- numeric(nrow(cv_params))
+  for (i in seq_len(nrow(cv_params))) {
+    s   <- cv_params$sigma[i]
+    lam <- cv_params$lambda[i]
+    fold_accs <- numeric(length(folds))
+
+    for (k in seq_along(folds)) {
+      tr_idx <- folds[[k]]$tr; va_idx <- folds[[k]]$va
+      X_tr <- Xtr[tr_idx, , drop = FALSE]; y_tr <- ytr[tr_idx]
+      X_va <- Xtr[va_idx, , drop = FALSE]; y_va <- ytr[va_idx]
+
+      K_tr  <- rbfK(X_tr, sigma = s)
+      Zinfo <- make_Z_train(K_tr)
+      Z_tr  <- Zinfo$Z_tr
+      U_div <- Zinfo$U_div
+
+      y_tr_01 <- ifelse(y_tr == 1, 1L, 0L)
+      fit <- glmnet::glmnet(
+        x = Z_tr, y = y_tr_01, family = "binomial",
+        alpha = 0, lambda = lam, intercept = TRUE, standardize = FALSE
+      )
+
+      K_va_tr <- rbfK(X_va, X_tr, sigma = s)
+      Z_va    <- make_Z_new(K_va_tr, U_div)
+      p_va    <- as.numeric(glmnet::predict.glmnet(fit, newx = Z_va, type = "response", s = lam))
+      y_hat   <- ifelse(p_va >= 0.5, 1L, -1L)
+      fold_accs[k] <- mean(y_hat == y_va)
+    }
+    cv_accs[i] <- mean(fold_accs)
+  }
+
+  best_idx <- which(cv_accs == max(cv_accs))
+  if (length(best_idx) > 1) {
+    G <- cv_params[best_idx, , drop = FALSE]
+    o <- order(-G$lambda, -G$sigma) # 큰 λ, 큰 σ 우선
+    best_idx <- best_idx[o[1]]
+  }
+  best_sigma  <- cv_params$sigma[best_idx]
+  best_lambda <- cv_params$lambda[best_idx]
+
+  K_full  <- rbfK(Xtr, sigma = best_sigma)
+  ZinfoF  <- make_Z_train(K_full)
+  Z_full  <- ZinfoF$Z_tr
+  U_div_F <- ZinfoF$U_div
+
+  ytr_01 <- ifelse(ytr == 1, 1L, 0L)
+  fitF <- glmnet::glmnet(
+    x = Z_full, y = ytr_01, family = "binomial",
+    alpha = 0, lambda = best_lambda, intercept = TRUE, standardize = FALSE
+  )
+
+  K_te_tr <- rbfK(Xte, Xtr, sigma = best_sigma)
+  Z_te    <- make_Z_new(K_te_tr, U_div_F)
+  p_te    <- as.numeric(glmnet::predict.glmnet(fitF, newx = Z_te, type = "response", s = best_lambda))
+  ifelse(p_te >= 0.5, 1L, -1L)
+}
+
+# ───────────────────────────────────────────────────────────────────
+# 3) loss-shifting 모델 이름/실행기 (svm_dual=T/F 동시)
+# ───────────────────────────────────────────────────────────────────
+build_model_names <- function(include_dual = TRUE) {
+  base_losses <- c("hinge", "sqhinge", "logistic", "exp")
+  styles      <- c("none", "soft", "hard")
+  loss_models <- as.vector(outer(base_losses, styles, paste, sep = "_"))
+  if (include_dual) {
+    loss_models <- as.vector(outer(loss_models, c("dualT", "dualF"), paste, sep = "_"))
+  }
+  c(loss_models, "e1071", "glm")
+}
+
+run_single_model <- function(model_name, Xtr_raw, ytr, Xte_raw, Xtr_s, Xte_s, kernel, seed = NULL) {
+  if (model_name == "e1071") return(pred_e1071_aligned(Xtr_s, ytr, Xte_s, kernel = kernel, seed = seed))
+  if (model_name == "glm")   return(pred_glm_kernel_glmnet(Xtr_s, ytr, Xte_s, seed = seed))
+
+  parts <- strsplit(model_name, "_")[[1]]
+  base_loss <- parts[1]
+  style     <- parts[2]
+  svm_dual  <- TRUE
+  if (length(parts) >= 3) svm_dual <- identical(parts[3], "dualT")
+
+  res <- train_loss_shift(
+    X_train = Xtr_raw, y_train = ytr, X_test = Xte_raw,
+    base_loss = base_loss, style = style, kernel = "gaussian",
+    restarts = 10, n_folds = 3, svm_dual = svm_dual,
+    max_iter = 100, line_search = TRUE, verbose = FALSE
+  )
+  res$test_pred
+}
+
+# ───────────────────────────────────────────────────────────────────
+# 4) 반복(작업)마다 즉시 저장하는 병렬 실행기
+#    - 각 job이 고유 CSV로 저장 (tmp.partial → rename 원자적 교체)
+# ───────────────────────────────────────────────────────────────────
+run_grid_fully_parallel <- function(n_train, n_test,
+                                    p_values = c(2, 5, 10),
+                                    rates_pos, rates_neg,
+                                    data_gen_fun = gen_parity_uniform,  # 기본: Uniform 분포
+                                    oracle_fun   = oracle_prod_sign,
+                                    kernel = "radial",
+                                    k = 20, seed = 2025,
+                                    results_dir = "results_incremental",
+                                    a = 1) {  # Uniform 범위 파라미터
+
+  if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+  plan(multisession)
+
+  task_grid <- expand.grid(
+    p        = p_values,
+    rate_pos = rates_pos,
+    rate_neg = rates_neg,
+    rep_i    = seq_len(k),
+    KEEP.OUT.ATTRS = FALSE,
+    stringsAsFactors = FALSE
+  )
+
+  model_names <- build_model_names(include_dual = TRUE)
+
+  cat(sprintf("\n--- Running %d jobs in parallel (p ∈ {%s}, k=%d) ---\n",
+              nrow(task_grid), paste(p_values, collapse = ","), k))
+
+  with_progress({
+    p_bar <- progressor(steps = nrow(task_grid))
+    results_list <- future_lapply(seq_len(nrow(task_grid)), function(j) {
+      p_j        <- task_grid$p[j]
+      rate_pos_j <- task_grid$rate_pos[j]
+      rate_neg_j <- task_grid$rate_neg[j]
+      rep_j      <- task_grid$rep_i[j]
+      seed_j     <- seed + j
+
+      # 데이터 생성 (Uniform[-a,a]^p)
+      Tr <- data_gen_fun(n_train, p = p_j, a = a, seed = seed_j + 1)
+      Te <- data_gen_fun(n_test,  p = p_j, a = a, seed = seed_j + 2)
+
+      # 표준화(훈련 기준)
+      st    <- .standardize_fit(Tr$X)
+      Xtr_s <- st$Xs
+      Xte_s <- .standardize_apply(Te$X, st$mu, st$sd)
+
+      # 노이즈 적용
+      ytr_noisy <- flip_labels_asym(
+        Tr$y, rate_pos = rate_pos_j, rate_neg = rate_neg_j, seed = seed_j + 3
+      )$y
+
+      # 모델 실행
+      acc_vec <- numeric(length(model_names))
+      for (m in seq_along(model_names)) {
+        y_pred <- run_single_model(
+          model_name = model_names[m],
+          Xtr_raw = Tr$X, ytr = ytr_noisy, Xte_raw = Te$X,
+          Xtr_s = Xtr_s, Xte_s = Xte_s,
+          kernel = kernel, seed = seed_j + 100 + m
+        )
+        acc_vec[m] <- acc(Te$y, y_pred)
+      }
+      true_acc <- acc(Te$y, oracle_fun(Te$X))
+
+      # long-format 결과
+      df_long <- tibble(
+        p = p_j,
+        rate_pos = rate_pos_j,
+        rate_neg = rate_neg_j,
+        rep = rep_j,
+        model = model_names,
+        accuracy = acc_vec,
+        true = true_acc
+      )
+
+      # 즉시 저장 (원자적)
+      safe_slug <- sprintf("p%d_rp%0.2f_rn%0.2f_rep%03d_seed%08d", p_j, rate_pos_j, rate_neg_j, rep_j, seed_j)
+      final_fp  <- file.path(results_dir, paste0("res_", safe_slug, ".csv"))
+      tmp_fp    <- paste0(final_fp, ".partial")
+      utils::write.csv(df_long, tmp_fp, row.names = FALSE)
+      file.rename(tmp_fp, final_fp)
+
+      p_bar(sprintf("p=%d rp=%.2f rn=%.2f rep=%d (saved)", p_j, rate_pos_j, rate_neg_j, rep_j))
+
+      # 메모리로도 반환
+      df_long
+    }, future.seed = TRUE)
+  })
+
+  bind_rows(results_list)
+}
+
+# ───────────────────────────────────────────────────────────────────
+# 5) 실행 파라미터 & 실행
+# ───────────────────────────────────────────────────────────────────
+N_TRAIN <- 100
+N_TEST  <- 400
+P_VALUES <- c(2, 5)              # 필요 시 c(2,5,10) 등으로 확장
+RATES_POS <- c(0.00, 0.05, 0.10)
+RATES_NEG <- c(0.00, 0.05)
+K_REPS <- 3
+SEED   <- 25
+RESULTS_DIR <- "results_incremental"
+A_RANGE <- 1                      # Uniform[-A_RANGE, A_RANGE]
+
+cat(sprintf("\n--- Running Scenario: Parity with Uniform[-%g,%g]^p (p ∈ {%s}) ---\n",
+            A_RANGE, A_RANGE, paste(P_VALUES, collapse = ",")))
+
+full_iteration_log <- run_grid_fully_parallel(
+  n_train = N_TRAIN, n_test = N_TEST,
+  p_values = P_VALUES,
+  rates_pos = RATES_POS, rates_neg = RATES_NEG,
+  data_gen_fun = gen_parity_uniform, oracle_fun = oracle_prod_sign,
+  kernel = "radial", k = K_REPS, seed = SEED,
+  results_dir = RESULTS_DIR, a = A_RANGE
+)
+
+# 합본 및 요약 저장(선택)
+write.csv(full_iteration_log, "xor_full_iteration_log.csv", row.names = FALSE)
+
+agg_table <- full_iteration_log %>%
+  group_by(p, rate_pos, rate_neg, model) %>%
+  summarise(mean_acc = mean(accuracy), sd_acc = sd(accuracy), .groups = "drop")
+
+write.csv(agg_table, "xor_agg_summary.csv", row.names = FALSE)
+
+cat("Saved incrementals in '", RESULTS_DIR, "' and aggregates (xor_full_iteration_log.csv, xor_agg_summary.csv).\n", sep = "")
+
+# ───────────────────────────────────────────────────────────────────
+# 6) (옵션) 중간에 중단되었을 때, 폴더에서 재집계하는 헬퍼
+# ───────────────────────────────────────────────────────────────────
+reaggregate_from_dir <- function(results_dir = "results_incremental",
+                                 out_full = "xor_full_iteration_log.csv",
+                                 out_agg  = "xor_agg_summary.csv") {
+  fs <- list.files(results_dir, pattern = "^res_.*\\.csv$", full.names = TRUE)
+  if (!length(fs)) {
+    message("No CSV found in ", results_dir)
+    return(invisible(NULL))
+  }
+  lst <- lapply(fs, utils::read.csv)
+  full <- bind_rows(lst)
+  utils::write.csv(full, out_full, row.names = FALSE)
+
+  agg <- full %>%
+    group_by(p, rate_pos, rate_neg, model) %>%
+    summarise(mean_acc = mean(accuracy), sd_acc = sd(accuracy), .groups = "drop")
+  utils::write.csv(agg, out_agg, row.names = FALSE)
+
+  message("Reaggregated: ", out_full, " / ", out_agg)
+  invisible(list(full = full, agg = agg))
+}
+
+```
+
