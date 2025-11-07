@@ -98,7 +98,7 @@ pred_e1071_aligned <- function(Xtr, ytr, Xte, kernel = "radial", seed = NULL) {
   } else {
     n <- nrow(Xtr)
     if (!is.null(seed)) set.seed(seed)
-    sigma_grid <- .sigma_grid_from_median_scaled(Xtr, sigma_mult = c(0.5, 1, 2), seed = seed)
+    sigma_grid <- .sigma_grid_from_median_scaled(Xtr, sigma_mult  = c(0.25,0.5,1,2.4), seed = seed)
     gamma_grid <- 1 / (2 * sigma_grid^2)
     lambda_grid <- 10^seq(-12, -2, length.out = 4)
     cost_grid <- 1 / (2 * n * lambda_grid + 1e-10)
@@ -142,7 +142,7 @@ pred_glm_kernel_glmnet <- function(Xtr, ytr, Xte, seed = NULL) {
 
   if (!is.null(seed)) set.seed(seed)
 
-  sigma_grid  <- .sigma_grid_from_median_scaled(Xtr, sigma_mult = c(0.5, 1, 2), seed = seed)
+  sigma_grid  <- .sigma_grid_from_median_scaled(Xtr, sigma_mult  = c(0.25,0.5,1,2.4), seed = seed)
   lambda_grid <- 10^seq(-12, -2, length.out = 4)
   cv_params   <- expand.grid(sigma = sigma_grid, lambda = lambda_grid, KEEP.OUT.ATTRS = FALSE)
   folds       <- cv_split(nrow(Xtr), n_folds = 3, strat_y = ytr, seed = seed)
@@ -217,15 +217,22 @@ pred_glm_kernel_glmnet <- function(Xtr, ytr, Xte, seed = NULL) {
 # ───────────────────────────────────────────────────────────────────
 # 3) loss-shifting 모델 이름/실행기 (svm_dual=T/F 동시)
 # ───────────────────────────────────────────────────────────────────
-build_model_names <- function(include_dual = TRUE) {
+build_model_names <- function(svm_dual_mode = c("both", "T", "F")) {
+  svm_dual_mode <- match.arg(svm_dual_mode)
   base_losses <- c("hinge", "sqhinge", "logistic", "exp")
   styles      <- c("none", "soft", "hard")
   loss_models <- as.vector(outer(base_losses, styles, paste, sep = "_"))
-  if (include_dual) {
+
+  if (svm_dual_mode == "both") {
     loss_models <- as.vector(outer(loss_models, c("dualT", "dualF"), paste, sep = "_"))
+  } else if (svm_dual_mode == "T") {
+    loss_models <- paste(loss_models, "dualT", sep = "_")
+  } else { # "F"
+    loss_models <- paste(loss_models, "dualF", sep = "_")
   }
   c(loss_models, "e1071", "glm")
 }
+
 
 run_single_model <- function(model_name, Xtr_raw, ytr, Xte_raw, Xtr_s, Xte_s, kernel, seed = NULL) {
   if (model_name == "e1071") return(pred_e1071_aligned(Xtr_s, ytr, Xte_s, kernel = kernel, seed = seed))
@@ -240,7 +247,7 @@ run_single_model <- function(model_name, Xtr_raw, ytr, Xte_raw, Xtr_s, Xte_s, ke
   res <- train_loss_shift(
     X_train = Xtr_raw, y_train = ytr, X_test = Xte_raw,
     base_loss = base_loss, style = style, kernel = "gaussian",
-    restarts = 10, n_folds = 3, svm_dual = svm_dual,
+    restarts = 10, n_folds = 5, svm_dual = svm_dual,
     max_iter = 100, line_search = TRUE, verbose = FALSE
   )
   res$test_pred
@@ -258,7 +265,10 @@ run_grid_fully_parallel <- function(n_train, n_test,
                                     kernel = "radial",
                                     k = 20, seed = 2025,
                                     results_dir = "results_incremental",
-                                    a = 1) {  # Uniform 범위 파라미터
+                                    a = 1,                        # Uniform 범위 파라미터
+                                    svm_dual_mode = c("both", "T", "F")) {
+
+  svm_dual_mode <- match.arg(svm_dual_mode)
 
   if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
   plan(multisession)
@@ -272,10 +282,11 @@ run_grid_fully_parallel <- function(n_train, n_test,
     stringsAsFactors = FALSE
   )
 
-  model_names <- build_model_names(include_dual = TRUE)
+  # 여기만 변경
+  model_names <- build_model_names(svm_dual_mode = svm_dual_mode)
 
-  cat(sprintf("\n--- Running %d jobs in parallel (p ∈ {%s}, k=%d) ---\n",
-              nrow(task_grid), paste(p_values, collapse = ","), k))
+  cat(sprintf("\n--- Running %d jobs in parallel (p ∈ {%s}, k=%d, svm_dual=%s) ---\n",
+              nrow(task_grid), paste(p_values, collapse = ","), k, svm_dual_mode))
 
   with_progress({
     p_bar <- progressor(steps = nrow(task_grid))
@@ -315,6 +326,7 @@ run_grid_fully_parallel <- function(n_train, n_test,
 
       # long-format 결과
       df_long <- tibble(
+        seed = seed_j,
         p = p_j,
         rate_pos = rate_pos_j,
         rate_neg = rate_neg_j,
@@ -344,12 +356,12 @@ run_grid_fully_parallel <- function(n_train, n_test,
 # ───────────────────────────────────────────────────────────────────
 # 5) 실행 파라미터 & 실행
 # ───────────────────────────────────────────────────────────────────
-N_TRAIN <- 100
-N_TEST  <- 400
+N_TRAIN <- 1000
+N_TEST  <- 1000
 P_VALUES <- c(2, 5)              # 필요 시 c(2,5,10) 등으로 확장
 RATES_POS <- c(0.00, 0.05, 0.10)
 RATES_NEG <- c(0.00, 0.05)
-K_REPS <- 3
+K_REPS <- 100
 SEED   <- 25
 RESULTS_DIR <- "results_incremental"
 A_RANGE <- 1                      # Uniform[-A_RANGE, A_RANGE]
@@ -363,7 +375,8 @@ full_iteration_log <- run_grid_fully_parallel(
   rates_pos = RATES_POS, rates_neg = RATES_NEG,
   data_gen_fun = gen_parity_uniform, oracle_fun = oracle_prod_sign,
   kernel = "radial", k = K_REPS, seed = SEED,
-  results_dir = RESULTS_DIR, a = A_RANGE
+  results_dir = RESULTS_DIR, a = A_RANGE,
+  svm_dual_mode = "F"
 )
 
 # 합본 및 요약 저장(선택)
