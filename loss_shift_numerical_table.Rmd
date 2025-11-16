@@ -6,11 +6,6 @@ output: html_document
 ---
 
 ```{r}
-# ───────────────────────────────────────────────────────────────────
-# Loss-shifting 실험 (iteration별 즉시 저장 + p∈{2,5,10} + svm_dual=T/F 동시)
-# 데이터 분포: Uniform[-a, a]^p + product-sign 라벨 (0이면 rnorm 기준 ±1)
-# 파일 구성: 이 스크립트 + 동일 폴더의 loss_shifting_v4.R
-# ───────────────────────────────────────────────────────────────────
 
 suppressPackageStartupMessages({
   library(e1071)
@@ -84,7 +79,7 @@ flip_labels_asym <- function(y, rate_pos = 0, rate_neg = 0, seed = NULL) {
 # ───────────────────────────────────────────────────────────────────
 # 1) 외부 의존 로드 (train_loss_shift, .sigma_grid_from_median_scaled, cv_split, rbf_kernel 등)
 # ───────────────────────────────────────────────────────────────────
-source("loss_shifting_v4.R")
+source("loss_shifting_v5.R")
 
 # ───────────────────────────────────────────────────────────────────
 # 2) 베이스라인 모델들
@@ -98,7 +93,7 @@ pred_e1071_aligned <- function(Xtr, ytr, Xte, kernel = "radial", seed = NULL) {
   } else {
     n <- nrow(Xtr)
     if (!is.null(seed)) set.seed(seed)
-    sigma_grid <- .sigma_grid_from_median_scaled(Xtr, sigma_mult  = c(0.25,0.5,1,2.4), seed = seed)
+    sigma_grid <- .sigma_grid_from_median_scaled(Xtr, sigma_mult  = c(0.5,1,2), seed = seed)
     gamma_grid <- 1 / (2 * sigma_grid^2)
     lambda_grid <- 10^seq(-12, -2, length.out = 4)
     cost_grid <- 1 / (2 * n * lambda_grid + 1e-10)
@@ -142,7 +137,7 @@ pred_glm_kernel_glmnet <- function(Xtr, ytr, Xte, seed = NULL) {
 
   if (!is.null(seed)) set.seed(seed)
 
-  sigma_grid  <- .sigma_grid_from_median_scaled(Xtr, sigma_mult  = c(0.25,0.5,1,2.4), seed = seed)
+  sigma_grid  <- .sigma_grid_from_median_scaled(Xtr, sigma_mult  = c(0.5,1,2), seed = seed)
   lambda_grid <- 10^seq(-12, -2, length.out = 4)
   cv_params   <- expand.grid(sigma = sigma_grid, lambda = lambda_grid, KEEP.OUT.ATTRS = FALSE)
   folds       <- cv_split(nrow(Xtr), n_folds = 3, strat_y = ytr, seed = seed)
@@ -247,7 +242,7 @@ run_single_model <- function(model_name, Xtr_raw, ytr, Xte_raw, Xtr_s, Xte_s, ke
   res <- train_loss_shift(
     X_train = Xtr_raw, y_train = ytr, X_test = Xte_raw,
     base_loss = base_loss, style = style, kernel = "gaussian",
-    restarts = 10, n_folds = 5, svm_dual = svm_dual,
+    restarts = 5, n_folds = 3, svm_dual = svm_dual,
     max_iter = 100, line_search = TRUE, verbose = FALSE
   )
   res$test_pred
@@ -356,12 +351,12 @@ run_grid_fully_parallel <- function(n_train, n_test,
 # ───────────────────────────────────────────────────────────────────
 # 5) 실행 파라미터 & 실행
 # ───────────────────────────────────────────────────────────────────
-N_TRAIN <- 1000
+N_TRAIN <- 200
 N_TEST  <- 1000
-P_VALUES <- c(2, 5)              # 필요 시 c(2,5,10) 등으로 확장
+P_VALUES <- c(2, 5, 10)              # 필요 시 c(2,5,10) 등으로 확장
 RATES_POS <- c(0.00, 0.05, 0.10)
-RATES_NEG <- c(0.00, 0.05)
-K_REPS <- 100
+RATES_NEG <- c(0.00, 0.05, 0.10)
+K_REPS <- 3
 SEED   <- 25
 RESULTS_DIR <- "results_incremental"
 A_RANGE <- 1                      # Uniform[-A_RANGE, A_RANGE]
@@ -390,29 +385,6 @@ write.csv(agg_table, "xor_agg_summary.csv", row.names = FALSE)
 
 cat("Saved incrementals in '", RESULTS_DIR, "' and aggregates (xor_full_iteration_log.csv, xor_agg_summary.csv).\n", sep = "")
 
-# ───────────────────────────────────────────────────────────────────
-# 6) (옵션) 중간에 중단되었을 때, 폴더에서 재집계하는 헬퍼
-# ───────────────────────────────────────────────────────────────────
-reaggregate_from_dir <- function(results_dir = "results_incremental",
-                                 out_full = "xor_full_iteration_log.csv",
-                                 out_agg  = "xor_agg_summary.csv") {
-  fs <- list.files(results_dir, pattern = "^res_.*\\.csv$", full.names = TRUE)
-  if (!length(fs)) {
-    message("No CSV found in ", results_dir)
-    return(invisible(NULL))
-  }
-  lst <- lapply(fs, utils::read.csv)
-  full <- bind_rows(lst)
-  utils::write.csv(full, out_full, row.names = FALSE)
-
-  agg <- full %>%
-    group_by(p, rate_pos, rate_neg, model) %>%
-    summarise(mean_acc = mean(accuracy), sd_acc = sd(accuracy), .groups = "drop")
-  utils::write.csv(agg, out_agg, row.names = FALSE)
-
-  message("Reaggregated: ", out_full, " / ", out_agg)
-  invisible(list(full = full, agg = agg))
-}
 
 ```
 
